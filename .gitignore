@@ -1,0 +1,7 @@
+# Build output
+build/
+
+# IDE / tooling metadata
+.cache/
+.cproject
+.project
