@@ -11,6 +11,9 @@
 bool esp_granny_enabled = false;
 bool esp_items_enabled = false;
 bool esp_fullbright_enabled = false;
+bool esp_items_ignore_active = false;
+bool esp_items_verbose = false;
+int esp_item_scan_limit = ITEMSPAWN_ITEM_COUNT;
 
 /* Tuned by eye in game -- Granny's model is a good deal taller in world
  * units than a stock Unity humanoid, hence the large height. */
@@ -43,15 +46,41 @@ typedef struct {
 
 static esp_item g_items[ITEMSPAWN_ITEM_COUNT];
 static int g_item_count = 0;
+static int g_items_alive = 0;
+static int g_items_active = 0;
 
 static unsigned long g_granny_ticks = 0;
 static unsigned long g_item_ticks = 0;
+
+/* ItemSpawn::Update turned out NOT to be a per-frame tick -- in practice it
+ * only runs when an item is picked up or dropped. So the hook is used only
+ * to capture the instance, and the actual position walk happens on the
+ * AI_Granny::FixedUpdate tick, which is reliably 50Hz. */
+static void *volatile g_item_spawn = NULL;
+
+/* A UnityEngine.Object whose native side has been destroyed keeps its
+ * managed wrapper, so the pointer still looks valid from C -- only
+ * m_CachedPtr going NULL reveals it. Calling into one of those dereferences
+ * a freed native object and crashes the game, so every Unity object has to
+ * pass through here before we touch it. */
+static bool unity_object_alive(void *object) {
+	if (!object) return false;
+	return *(void **)((uintptr_t)object + FIELD_UnityObject_m_CachedPtr) != NULL;
+}
 
 void esp_get_debug_info(esp_debug_info *out) {
 	if (!out) return;
 	out->have_view_projection = g_have_view_projection;
 	out->have_granny_position = g_have_granny_position;
 	out->item_count = g_item_count;
+	out->items_alive = g_items_alive;
+	out->items_active = g_items_active;
+	out->have_item_spawn = (g_item_spawn != NULL);
+	out->item_spawn = g_item_spawn;
+	out->item_spawn_alive = unity_object_alive(g_item_spawn);
+	out->item_slot0 = g_item_spawn
+	                      ? *(void **)((uintptr_t)g_item_spawn + ITEMSPAWN_FIRST_ITEM_FIELD)
+	                      : NULL;
 	out->granny_ticks = g_granny_ticks;
 	out->item_ticks = g_item_ticks;
 }
@@ -151,15 +180,16 @@ static void multiply_unity_matrices(const float *a, const float *b, esp_mat4 *ou
  * depends on no tags or IL2CPP calls at all. */
 static void *resolve_camera(uintptr_t base) {
 	void *camera = ((Camera_get_main_t)(base + OFFSET_Camera_get_main))(NULL);
-	if (camera) return camera;
+	if (unity_object_alive(camera)) return camera;
 
 	void *granny = ai_granny_current();
-	if (!granny) return NULL;
+	if (!unity_object_alive(granny)) return NULL;
 
 	void *player_status = *(void **)((uintptr_t)granny + FIELD_AI_Granny_PlayerStatus);
-	if (!player_status) return NULL;
+	if (!unity_object_alive(player_status)) return NULL;
 
-	return *(void **)((uintptr_t)player_status + FIELD_PlayerStatus_PlayerCam);
+	camera = *(void **)((uintptr_t)player_status + FIELD_PlayerStatus_PlayerCam);
+	return unity_object_alive(camera) ? camera : NULL;
 }
 
 /* Main thread only. Refreshed from both hooks so the overlay still has a
@@ -221,21 +251,32 @@ void esp_collect(void *granny_instance) {
 	}
 
 	g_have_granny_position = false;
-	if (granny_instance) {
+	if (unity_object_alive(granny_instance)) {
 		void *transform =
 		    ((Component_get_transform_t)(base + OFFSET_Component_get_transform))(granny_instance, NULL);
-		if (transform) {
+		if (unity_object_alive(transform)) {
 			esp_vec3 position;
 			((Transform_get_position_t)(base + OFFSET_Transform_get_position))(&position, transform, NULL);
 			g_granny_position = position;
 			g_have_granny_position = true;
 		}
 	}
+
+	/* Item collection is disabled: see hooked_item_spawn_update() for why
+	 * ItemSpawn can't provide the world's items. */
+	g_item_count = 0;
 }
 
+/* Walks ItemSpawn's item pointers. Driven from esp_collect() on the
+ * FixedUpdate tick, not from the ItemSpawn hook -- that one only fires on
+ * pickup/drop, so positions would almost never refresh. */
 void esp_collect_items(void *item_spawn) {
 	g_item_count = 0;
-	if (!item_spawn) return;
+	g_items_alive = 0;
+	g_items_active = 0;
+	/* The instance is latched from a hook that may have fired a level ago,
+	 * so verify it's still alive before touching it. */
+	if (!unity_object_alive(item_spawn)) return;
 
 	uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
 	if (base == 0) return;
@@ -247,14 +288,30 @@ void esp_collect_items(void *item_spawn) {
 	GameObject_get_active_t get_active =
 	    (GameObject_get_active_t)(base + OFFSET_GameObject_get_activeInHierarchy);
 
-	for (int i = 0; i < ITEMSPAWN_ITEM_COUNT; i++) {
+	int limit = esp_item_scan_limit;
+	if (limit < 0) limit = 0;
+	if (limit > ITEMSPAWN_ITEM_COUNT) limit = ITEMSPAWN_ITEM_COUNT;
+
+	for (int i = 0; i < limit; i++) {
 		void *object = *(void **)((uintptr_t)item_spawn + ITEMSPAWN_FIRST_ITEM_FIELD + i * 8);
-		if (!object) continue;
+
+		if (esp_items_verbose) {
+			char line[160];
+			wsprintfA(line, "[esp] slot %d %s ptr=%p", i, g_item_names[i], object);
+			OutputDebugStringA(line);
+		}
+
+		/* Destroyed items keep a non-NULL managed wrapper, so a plain NULL
+		 * check isn't enough -- this is what was crashing the game. */
+		if (!unity_object_alive(object)) continue;
+		g_items_alive++;
 		/* Already picked up (or not spawned for this run's layout). */
-		if (!get_active(object, NULL)) continue;
+		bool active = get_active(object, NULL);
+		if (active) g_items_active++;
+		if (!active && !esp_items_ignore_active) continue;
 
 		void *transform = get_transform(object, NULL);
-		if (!transform) continue;
+		if (!unity_object_alive(transform)) continue;
 
 		esp_vec3 position;
 		get_position(&position, transform, NULL);
@@ -269,18 +326,21 @@ static ItemSpawn_Update_t original_item_spawn_update = NULL;
 
 static void __fastcall hooked_item_spawn_update(void *instance) {
 	g_item_ticks++;
-
-	/* Per-frame and independent of whether Granny is alive, so this is the
-	 * better place to refresh the camera than the 50Hz FixedUpdate hook. */
-	if (esp_granny_enabled || esp_items_enabled) {
-		uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
-		if (base != 0) refresh_camera(base);
-	}
-	/* Skipped entirely while Item ESP is off -- 55 items x 3 IL2CPP calls
-	 * every frame is not something to pay for unless it's on screen. */
-	if (esp_items_enabled) {
-		esp_collect_items(instance);
-	}
+	/* Deliberately NOT latching the instance any more.
+	 *
+	 * Decompiling ItemSpawn::Update showed it isn't an item registry at all:
+	 * it activates ONE item chosen by CountItem, throws it with AddForce,
+	 * unparents it, then calls Destroy(this.gameObject) on itself. So every
+	 * instance is a one-shot spawner that dies during its first Update.
+	 *
+	 * Holding that pointer was a use-after-free: once the GC reused the
+	 * block, the m_CachedPtr check would pass on unrelated data and we'd
+	 * read 55 garbage "pointers" out of it and call into them. That is what
+	 * crashed on game version 1.8, where many spawners run at level start.
+	 *
+	 * The real world items are the objects these spawners activate and
+	 * unparent, which have to be found some other way. */
+	(void)instance;
 	original_item_spawn_update(instance);
 }
 

@@ -89,6 +89,15 @@ ANNOTATIONS = [
         "and stores the result into CurrentTarget (+0xB0).",
     ),
     (
+        0x1C1510,
+        "AI_Granny__MurderNoiseObjs",
+        "void __fastcall f(void *__this);",
+        "AI_Granny::MurderNoiseObjs -- the helper both StopAI and\n"
+        "ResetAIDecision call first (shows up as sub_1801C1510 before naming).\n"
+        "Uses GameObject::FindGameObjectsWithTag, so noise objects ARE tagged\n"
+        "-- but items are not, which rules out tag-based item enumeration.",
+    ),
+    (
         0x1C1930,
         "AI_Granny__ResetAIDecision",
         "void __fastcall f(void *__this);",
@@ -143,15 +152,37 @@ ANNOTATIONS = [
         0x21F2C0,
         "ItemSpawn__Update",
         "void __fastcall f(void *__this);",
-        "ItemSpawn::Update -- hooked to capture the ItemSpawn instance, same\n"
-        "trick as AI_Granny::FixedUpdate, and used as grannycheat's per-frame\n"
-        "main-thread tick (FixedUpdate is only 50Hz, and stops entirely when\n"
-        "Granny isn't alive).\n"
+        "ItemSpawn::Update -- a ONE-SHOT SELF-DESTRUCTING DROPPER, not a\n"
+        "per-frame tick and not an item registry. Decompiled:\n"
         "\n"
-        "ItemSpawn holds 55 contiguous GameObject* fields, crossbow at +0x28\n"
-        "through fuse at +0x1D8, 8 bytes apart -- walk them as an array. An item\n"
-        "that's already been picked up has its GameObject deactivated, so filter\n"
-        "with GameObject::get_activeInHierarchy.",
+        "  if (!Spawned) {\n"
+        "      item = <one field picked by CountItem: 1.0=crossbow ...\n"
+        "              20.0=melon ... 55.0=fuse>;\n"
+        "      SetActive(item, true);\n"
+        "      AddForce(item.rigidbody, forward * DropForceItem);\n"
+        "      set_parent(item.transform, null);\n"
+        "      Spawned = true;\n"
+        "      Destroy(this.gameObject);   // <-- destroys ITSELF\n"
+        "  }\n"
+        "\n"
+        "PickRay::CheckItemDropping is what creates these: on a player drop it\n"
+        "Instantiates the ItemDrop prefab, GetComponent<ItemSpawn>()s it, and\n"
+        "writes CountItem to choose which item. So an instance exists only for\n"
+        "the single frame of one drop.\n"
+        "\n"
+        "Consequences, learned the hard way:\n"
+        "  * Hooking this yields a tick only per pickup/drop, never per frame.\n"
+        "  * Latching `this` is a use-after-free -- the object is destroyed at\n"
+        "    the end of the call. Once the GC reuses the block, a m_CachedPtr\n"
+        "    liveness check passes on unrelated data and the 55 item fields\n"
+        "    read as garbage pointers. That crashed the game on game version\n"
+        "    1.8, where many drops happen at level start.\n"
+        "  * The 55 GameObject* fields (crossbow +0x28 .. fuse +0x1D8, stride\n"
+        "    8) are this dropper's own references, NOT the level's items.\n"
+        "\n"
+        "For enumerating world items, this class is a dead end -- so are\n"
+        "Inventory/ItemDefs, which describe held items (name, hand model,\n"
+        "pickup sound), not world positions.",
     ),
     # ---- UnityEngine: trailing MethodInfo*, NULL is accepted -------------
     (

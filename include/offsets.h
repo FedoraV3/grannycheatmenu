@@ -185,6 +185,18 @@ static const uintptr_t OFFSET_Camera_get_worldToCameraMatrix  = 0x6FEA00;
 static const uintptr_t OFFSET_Camera_get_projectionMatrix     = 0x6FE6B0;
 typedef void *(__fastcall *Camera_get_matrix_t)(void *ret_matrix4x4, void *instance, void *method);
 
+/**
+ * UnityEngine.Object::m_CachedPtr -- the native object behind the managed
+ * wrapper.
+ *
+ * Unity zeroes this on Destroy() but keeps the managed object alive, so a
+ * destroyed GameObject still reads as a perfectly valid non-NULL pointer
+ * from C. Unity's own == operator hides that ("fake null"); we can't, so
+ * check this before calling ANY method on a UnityEngine.Object or the call
+ * dereferences a freed native object and takes the game down.
+ */
+static const uintptr_t FIELD_UnityObject_m_CachedPtr          = 0x10;
+
 /** GameObject::get_transform -- GameObject isn't a Component, so it has its own. */
 static const uintptr_t OFFSET_GameObject_get_transform        = 0x720600;
 

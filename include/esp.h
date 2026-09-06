@@ -20,6 +20,32 @@ extern bool esp_items_enabled;
 extern bool esp_fullbright_enabled;
 
 /**
+ * Debug aid: draw items that are alive but not active in the hierarchy.
+ *
+ * If nothing shows with this off but boxes appear at sensible world
+ * positions with it on, the active check is the problem. If they instead
+ * pile up at one spot or the origin, ItemSpawn's fields are prefab
+ * templates rather than the live scene objects.
+ */
+extern bool esp_items_ignore_active;
+
+/**
+ * Debug aid: log each item slot to OutputDebugStringA before touching it.
+ *
+ * If the item walk crashes the game, DebugView's last line names the exact
+ * slot that did it -- the log survives the crash, a breakpoint wouldn't.
+ * Noisy (runs per collect), so leave it off unless chasing a crash.
+ */
+extern bool esp_items_verbose;
+
+/**
+ * Debug aid: stop the item walk after this many slots (1..55).
+ *
+ * Lets a crash be bisected by scan depth without a rebuild each time.
+ */
+extern int esp_item_scan_limit;
+
+/**
  * Box dimensions for the Granny marker, in world units. Her transform sits
  * at her feet, so the box is drawn from there upward by esp_box_height.
  * Tunable at runtime because the right value depends on the model's actual
@@ -98,7 +124,13 @@ int esp_install_hooks(void);
 typedef struct {
 	bool have_view_projection;  /**< A camera matrix has been captured. */
 	bool have_granny_position;  /**< Granny's transform position was read. */
-	int item_count;             /**< Items found still active last collect. */
+	int item_count;             /**< Items drawn (passed every filter). */
+	int items_alive;            /**< Of 55 slots, how many are live objects. */
+	int items_active;           /**< Of those, how many are active in a scene. */
+	bool have_item_spawn;       /**< The ItemSpawn instance has been captured. */
+	bool item_spawn_alive;      /**< ...and its native object still exists. */
+	void *item_spawn;           /**< The captured instance pointer itself. */
+	void *item_slot0;           /**< Raw pointer in the first item field (+0x28). */
 	unsigned long granny_ticks; /**< AI_Granny::FixedUpdate hook call count. */
 	unsigned long item_ticks;   /**< ItemSpawn::Update hook call count. */
 } esp_debug_info;

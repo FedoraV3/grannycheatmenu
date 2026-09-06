@@ -220,6 +220,19 @@ static void draw_visuals_tab() {
 	ImGui::SliderFloat("Box height", &esp_box_height, 0.5f, 5.0f, "%.2f");
 	ImGui::SliderFloat("Box width", &esp_box_width_ratio, 0.1f, 1.5f, "%.2f");
 
+	ImGui::SliderInt("Items: scan limit", &esp_item_scan_limit, 0, 55);
+	ImGui::Checkbox("Items: log each slot", &esp_items_verbose);
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip("Logs every slot to DebugView before touching it.\n"
+		                  "After a crash, the last line names the culprit.");
+	}
+	ImGui::Checkbox("Items: ignore active check", &esp_items_ignore_active);
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip("Debug: draw items even if inactive.\n"
+		                  "Sensible positions = the active check is wrong.\n"
+		                  "All at one spot = they're prefabs, not scene objects.");
+	}
+
 	ImGui::Separator();
 	ImGui::TextDisabled("Planned");
 	wip_checkbox("Fullbright", &wip_fullbright);
@@ -260,6 +273,11 @@ static void draw_debug_tab() {
 	ImGui::Text("ItemSpawn hook     %lu ticks", esp.item_ticks);
 	ImGui::Text("camera matrix      %s", esp.have_view_projection ? "ok" : "MISSING");
 	ImGui::Text("granny position    %s", esp.have_granny_position ? "ok" : "MISSING");
+	ImGui::Text("ItemSpawn instance %s  0x%llX",
+	            !esp.have_item_spawn ? "MISSING" : (esp.item_spawn_alive ? "alive" : "DEAD"),
+	            (unsigned long long)(uintptr_t)esp.item_spawn);
+	ImGui::Text("item[0] crossbow   0x%llX", (unsigned long long)(uintptr_t)esp.item_slot0);
+	ImGui::Text("items alive/active %d / %d  (of 55)", esp.items_alive, esp.items_active);
 	ImGui::Text("items visible      %d", esp.item_count);
 
 	ImGui::Separator();
