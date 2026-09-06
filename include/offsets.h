@@ -118,6 +118,19 @@ typedef granny_method_t ItemSpawn_Update_t;
 #define ITEMSPAWN_ITEM_COUNT       55
 
 /**
+ * ItemSpawn::CountItem -- selects which of the 55 fields this dropper will
+ * spawn, as a 1-based float (1.0 = crossbow ... 20.0 = melon ... 55.0 =
+ * fuse). PickRay::CheckItemDropping writes it right after instantiating the
+ * ItemDrop prefab.
+ *
+ * Reading this inside a hook on ItemSpawn::Update -- while the spawner is
+ * still alive -- is how a dropped item gets tracked. The GameObject it
+ * points to outlives the spawner, so keeping THAT pointer is safe even
+ * though keeping the spawner's was not.
+ */
+static const uintptr_t FIELD_ItemSpawn_CountItem              = 0x24;
+
+/**
  * ItemRepositionSeed::Awake -- hooked to capture the object that actually
  * holds the level's items.
  *

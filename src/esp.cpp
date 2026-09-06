@@ -38,12 +38,52 @@ static const char *const g_item_names[ITEMSEED_ITEM_COUNT] = {
 	"EC Key", "Fuse",
 };
 
+/* Names for dropped items, indexed by CountItem - 1.
+ *
+ * ORDER COMES FROM ItemSpawn::Update's dispatch chain, NOT from dump.cs's
+ * field declaration order -- the two disagree. The decompile maps 29 to
+ * shotgun and 30 to shotgun2 (dump.cs declares shotgun2 after sp3), and 53
+ * to ornamentfreeze before 54 ornamentbomb (dump.cs has bomb first). Taking
+ * the declaration order mislabelled slots 29-32 and 52-53.
+ *
+ * Wording matches g_item_names above where it's the same item, so an item
+ * doesn't rename itself when you drop it. */
+static const char *const g_dropped_names[ITEMSPAWN_ITEM_COUNT] = {
+	"Crossbow", "Pliers", "Battery", "Gas", "Bird Seed", "Book", "Winch",
+	"Car Battery", "Car Key", "Chain Cutter", "Code", "Baton", "EC Key",
+	"Hammer", "Padlock Key", "Master Key", "Cog 1", "Cog 2", "Meat",
+	"Melon", "Spray", "Plank", "Playhouse Key", "Remote", "Robo Data",
+	"Rusty Key", "Safe Key", "Screwdriver", "Shotgun", "Shotgun 2",
+	"SP 1", "SP 2", "SP 3", "Spark Plug", "Special", "Spider", "Syringe",
+	"T1", "T2", "T3", "T4", "Teddy", "Text", "Topp", "WP Key", "Vase",
+	"Vase 2", "Vase 3", "Wheel Crank", "Wooden Stick", "Wrench", "Rat",
+	"Freeze Ornament", "Bomb Ornament", "Fuse",
+};
+
+/* GameObject per dropped item, indexed by CountItem - 1 so re-dropping the
+ * same item overwrites its slot instead of accumulating duplicates.
+ *
+ * These pointers are NOT rooted by anything in the game once the item is
+ * picked back up and destroyed, so IL2CPP's GC is free to reclaim and reuse
+ * the block. m_CachedPtr alone can't detect that -- whatever object lands
+ * there next has its own non-zero m_CachedPtr, so the check passes and we
+ * call GameObject methods on something that isn't one. See
+ * gameobject_still_valid(). */
+static void *volatile g_dropped[ITEMSPAWN_ITEM_COUNT];
+
+/* Il2CppClass* of GameObject, captured from an object we know is a live
+ * GameObject. Cheaper than resolving the TypeInfo global, and exact. */
+static void *volatile g_gameobject_klass = NULL;
+
+
 typedef struct {
 	esp_vec3 position;
 	const char *name;
 } esp_item;
 
-static esp_item g_items[ITEMSEED_ITEM_COUNT];
+#define ESP_MAX_ITEMS (ITEMSEED_ITEM_COUNT + ITEMSPAWN_ITEM_COUNT)
+
+static esp_item g_items[ESP_MAX_ITEMS];
 static int g_item_count = 0;
 static int g_items_alive = 0;
 static int g_items_active = 0;
@@ -69,6 +109,20 @@ static void *volatile g_pickray = NULL;
 static bool unity_object_alive(void *object) {
 	if (!object) return false;
 	return *(void **)((uintptr_t)object + FIELD_UnityObject_m_CachedPtr) != NULL;
+}
+
+/* Every IL2CPP object stores its Il2CppClass* at offset 0, so a block the
+ * GC has reused almost always shows a different class here. Combined with
+ * the liveness check, this makes a dangling dropped-item pointer safe to
+ * skip rather than fatal to dereference.
+ *
+ * Not airtight: if the GC reuses the block for another GameObject this
+ * passes and the item draws at a wrong position. A cosmetic glitch instead
+ * of a crash is the trade being made. */
+static bool gameobject_still_valid(void *object) {
+	if (!unity_object_alive(object)) return false;
+	if (!g_gameobject_klass) return true; /* nothing to compare against yet */
+	return *(void **)object == g_gameobject_klass;
 }
 
 void esp_get_debug_info(esp_debug_info *out) {
@@ -331,6 +385,38 @@ void esp_collect_items(void *item_seed) {
 		g_items[g_item_count].name = g_item_names[i];
 		g_item_count++;
 	}
+
+	/* Dropped items are separate objects that ItemRepositionSeed never
+	 * learns about, so they're tracked from the drop and walked here. These
+	 * are GameObjects rather than Transforms, hence the extra hop. */
+	Component_get_transform_t get_transform =
+	    (Component_get_transform_t)(base + OFFSET_GameObject_get_transform);
+	GameObject_get_active_t get_active =
+	    (GameObject_get_active_t)(base + OFFSET_GameObject_get_activeInHierarchy);
+
+	for (int i = 0; i < ITEMSPAWN_ITEM_COUNT && g_item_count < ESP_MAX_ITEMS; i++) {
+		void *object = g_dropped[i];
+		/* Picked up again -- destroyed, or at least deactivated. The class
+		 * check also rejects a slot whose object the GC has since reclaimed
+		 * and reused, which a liveness check alone would let through. */
+		if (!gameobject_still_valid(object)) {
+			g_dropped[i] = NULL; /* stop re-testing a dead slot every frame */
+			continue;
+		}
+		if (!get_active(object, NULL)) continue;
+
+		void *transform = get_transform(object, NULL);
+		if (!unity_object_alive(transform)) continue;
+
+		esp_vec3 position;
+		get_position(&position, transform, NULL);
+
+		g_items_alive++;
+		g_items_active++;
+		g_items[g_item_count].position = position;
+		g_items[g_item_count].name = g_dropped_names[i];
+		g_item_count++;
+	}
 }
 
 static ItemRepositionSeed_Awake_t original_item_seed_awake = NULL;
@@ -345,7 +431,41 @@ static ItemRepositionSeed_Awake_t original_item_seed_awake = NULL;
 static void __fastcall hooked_item_seed_awake(void *instance) {
 	g_item_ticks++;
 	g_item_spawn = instance;
+	/* New level: every dropped-item pointer from the old one is stale. */
+	for (int i = 0; i < ITEMSPAWN_ITEM_COUNT; i++) {
+		g_dropped[i] = NULL;
+	}
 	original_item_seed_awake(instance);
+}
+
+static ItemSpawn_Update_t original_item_spawn_update = NULL;
+
+/* Records the item a dropper is about to spawn.
+ *
+ * ItemSpawn::Update activates one item chosen by CountItem, throws it,
+ * unparents it, then destroys its own GameObject. The spawner therefore
+ * cannot be kept (that was the v1.8 use-after-free) -- but the item it
+ * spawns is a separate object that outlives it, so reading that pointer
+ * here, while the spawner is still alive, is safe.
+ *
+ * Needed because a dropped item is a fresh Instantiate() that
+ * ItemRepositionSeed has no reference to. Without this, picking an item up
+ * and dropping it would hide it from the ESP for the rest of the session. */
+static void __fastcall hooked_item_spawn_update(void *instance) {
+	if (unity_object_alive(instance)) {
+		float count = *(float *)((uintptr_t)instance + FIELD_ItemSpawn_CountItem);
+		int index = (int)count - 1; /* CountItem is 1-based */
+		if (index >= 0 && index < ITEMSPAWN_ITEM_COUNT) {
+			void *item = *(void **)((uintptr_t)instance + ITEMSPAWN_FIRST_ITEM_FIELD + index * 8);
+			if (unity_object_alive(item)) {
+				/* Known-good GameObject, so this is the moment to learn what
+				 * a GameObject's Il2CppClass* looks like. */
+				if (!g_gameobject_klass) g_gameobject_klass = *(void **)item;
+				g_dropped[index] = item;
+			}
+		}
+	}
+	original_item_spawn_update(instance);
 }
 
 static PickRay_Update_t original_pickray_update = NULL;
@@ -386,6 +506,17 @@ int esp_install_hooks(void) {
 	}
 	if (MH_EnableHook(target) != MH_OK) {
 		OutputDebugStringA("[cheat] MH_EnableHook(ItemRepositionSeed::Awake) failed");
+		return 0;
+	}
+
+	void *spawn_target = (void *)(base + OFFSET_ItemSpawn_Update);
+	if (MH_CreateHook(spawn_target, (void *)&hooked_item_spawn_update,
+	                  (void **)&original_item_spawn_update) != MH_OK) {
+		OutputDebugStringA("[cheat] MH_CreateHook(ItemSpawn::Update) failed");
+		return 0;
+	}
+	if (MH_EnableHook(spawn_target) != MH_OK) {
+		OutputDebugStringA("[cheat] MH_EnableHook(ItemSpawn::Update) failed");
 		return 0;
 	}
 
