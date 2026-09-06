@@ -45,7 +45,6 @@ static bool wip_noclip = false;
 static bool wip_infinite_jump = false;
 static float wip_player_speed = 1.0f;
 
-static bool wip_granny_blind = false;
 static bool wip_granny_deaf = false;
 static bool wip_freeze_in_place = false;
 static float wip_granny_speed = 1.0f;
@@ -194,10 +193,13 @@ static void draw_granny_tab() {
 		}
 	}
 
+	/* Re-applied every FixedUpdate tick rather than on toggle, since the
+	 * game's BlindTimer clears IsBlind by itself. */
+	ImGui::Checkbox("Blind (ignore sight)", &granny_is_blind);
+
 	ImGui::Separator();
 	ImGui::TextDisabled("Planned");
 	wip_checkbox("Freeze in place", &wip_freeze_in_place);
-	wip_checkbox("Blind (ignore sight)", &wip_granny_blind);
 	wip_checkbox("Deaf (ignore sound)", &wip_granny_deaf);
 	wip_slider("Granny speed", &wip_granny_speed, 0.1f, 3.0f);
 }

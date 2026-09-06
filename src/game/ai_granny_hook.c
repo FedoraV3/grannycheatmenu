@@ -13,6 +13,11 @@ static PlayerStatus_KnockDeath_t original_granny_knock_death = NULL;
 static void *volatile g_granny_instance = NULL;
 static uintptr_t g_gameassembly_base = 0;
 
+/* Bound to the "Blind" checkbox in the Granny tab. Applied every tick in
+ * hooked_fixed_update rather than once on toggle, because BlindTimer means
+ * the game clears IsBlind on its own. */
+bool granny_is_blind = false;
+
 static void __fastcall hooked_fixed_update(void *instance) {
     g_granny_instance = instance;
 
@@ -20,6 +25,20 @@ static void __fastcall hooked_fixed_update(void *instance) {
      * call into IL2CPP -- so ESP gathers its camera/position data here and
      * the render thread just draws the cached results. */
     esp_collect(instance);
+	
+	/* Blind toggle, polled here because this is the game's main thread.
+	 *
+	 * Re-applied every tick rather than written once, since BlindTimer
+	 * (+0x168) means the game clears IsBlind on its own.
+	 *
+	 * Deliberately only writes when the toggle is ON. Forcing it to false
+	 * otherwise would also cancel the game's own blinding -- pepper spray
+	 * sets this flag (see PepperedEnemy at +0x178), so an else branch here
+	 * would wipe the effect a tick after the player used the spray. With
+	 * the toggle off, BlindTimer just runs down naturally. */
+	if (granny_is_blind && instance != NULL) {
+		*(volatile bool *)((uintptr_t)instance + FIELD_AI_Granny_IsBlind) = true;
+	}
 
     original_fixed_update(instance);
 }

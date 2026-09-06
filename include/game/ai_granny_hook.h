@@ -4,6 +4,10 @@
 extern "C" {
 #endif
 
+#include <stdbool.h>
+
+extern bool granny_is_blind;
+
 /**
  * @brief Hook AI_Granny::FixedUpdate to keep a live pointer to the current
  * AI_Granny instance.
