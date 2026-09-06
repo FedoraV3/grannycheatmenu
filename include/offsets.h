@@ -117,6 +117,29 @@ typedef granny_method_t ItemSpawn_Update_t;
 #define ITEMSPAWN_FIRST_ITEM_FIELD 0x28
 #define ITEMSPAWN_ITEM_COUNT       55
 
+/**
+ * ItemRepositionSeed::Awake -- hooked to capture the object that actually
+ * holds the level's items.
+ *
+ * Unlike ItemSpawn this is a persistent level fixture (it also has an
+ * OnTriggerEnter), so the pointer stays usable rather than destroying
+ * itself mid-frame. Awake fires once per level load, so the capture
+ * self-heals across reloads. Game-assembly method: single argument, no
+ * trailing MethodInfo*.
+ */
+static const uintptr_t OFFSET_ItemRepositionSeed_Awake        = 0x245DC0;
+typedef granny_method_t ItemRepositionSeed_Awake_t;
+
+/*
+ * ItemRepositionSeed's item references: 35 Transform* fields laid out
+ * contiguously from `Pliers` at 0x28 through `Fuse` at 0x138, 8 bytes
+ * apart. These are Transforms rather than GameObjects, so reading a
+ * position is a single Transform::get_position call with no GetComponent
+ * step. Slot names live in esp.cpp in this same order.
+ */
+#define ITEMSEED_FIRST_ITEM_FIELD 0x28
+#define ITEMSEED_ITEM_COUNT       35
+
 /*
  * AI_Granny *instance field* offsets (from Il2CppDumper's dump.cs). These
  * are offsets into the object -- add them to an instance pointer from

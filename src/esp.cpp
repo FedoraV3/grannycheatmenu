@@ -13,7 +13,7 @@ bool esp_items_enabled = false;
 bool esp_fullbright_enabled = false;
 bool esp_items_ignore_active = false;
 bool esp_items_verbose = false;
-int esp_item_scan_limit = ITEMSPAWN_ITEM_COUNT;
+int esp_item_scan_limit = ITEMSEED_ITEM_COUNT;
 
 /* Tuned by eye in game -- Granny's model is a good deal taller in world
  * units than a stock Unity humanoid, hence the large height. */
@@ -26,17 +26,16 @@ static bool g_have_view_projection = false;
 static esp_vec3 g_granny_position;
 static bool g_have_granny_position = false;
 
-/* Names for ItemSpawn's 55 GameObject* fields, in declaration order --
- * index N here is the field at ITEMSPAWN_FIRST_ITEM_FIELD + N * 8. */
-static const char *const g_item_names[ITEMSPAWN_ITEM_COUNT] = {
-	"crossbow", "plier", "battery", "gas", "seed", "book", "winch",
-	"car battery", "car key", "cutter", "code", "baton", "ec key", "hammer",
-	"padlock", "mas", "cogwheel 1", "cogwheel 2", "meat", "melon", "spray",
-	"plank", "playhouse", "remote", "data", "rusty", "safe", "screwdriver",
-	"shotgun", "sp1", "sp2", "sp3", "shotgun 2", "spark", "special",
-	"spider", "syringe", "t1", "t2", "t3", "t4", "teddy", "text", "topp",
-	"wp", "vas", "vas2", "vas3", "wheel", "stick", "wrench", "rat",
-	"ornament bomb", "ornament freeze", "fuse",
+/* Names for ItemRepositionSeed's 35 Transform* fields, in declaration order
+ * -- index N is the field at ITEMSEED_FIRST_ITEM_FIELD + N * 8. */
+static const char *const g_item_names[ITEMSEED_ITEM_COUNT] = {
+	"Pliers", "Master Key", "Hammer", "PD Key", "Code", "Safe Key",
+	"WP Key", "Battery", "Winch", "Melon", "Playhouse Key", "Red Cog",
+	"Orange Cog", "Barrel", "Buttstock", "Trigger", "Car Key",
+	"Spark Plug", "Gas", "Engine", "Car Battery", "Wrench", "Book",
+	"Meat", "SP Key", "Remote", "Bird Seed", "Wheel Crank",
+	"Chain Cutter", "Wooden Stick", "Rusty Key", "Robo Data", "Baton",
+	"EC Key", "Fuse",
 };
 
 typedef struct {
@@ -44,7 +43,7 @@ typedef struct {
 	const char *name;
 } esp_item;
 
-static esp_item g_items[ITEMSPAWN_ITEM_COUNT];
+static esp_item g_items[ITEMSEED_ITEM_COUNT];
 static int g_item_count = 0;
 static int g_items_alive = 0;
 static int g_items_active = 0;
@@ -52,10 +51,9 @@ static int g_items_active = 0;
 static unsigned long g_granny_ticks = 0;
 static unsigned long g_item_ticks = 0;
 
-/* ItemSpawn::Update turned out NOT to be a per-frame tick -- in practice it
- * only runs when an item is picked up or dropped. So the hook is used only
- * to capture the instance, and the actual position walk happens on the
- * AI_Granny::FixedUpdate tick, which is reliably 50Hz. */
+/* The ItemRepositionSeed instance, latched at its Awake. It holds the
+ * level's 35 item Transforms and persists, unlike ItemSpawn which destroys
+ * itself. Walked on the FixedUpdate tick. */
 static void *volatile g_item_spawn = NULL;
 
 /* A UnityEngine.Object whose native side has been destroyed keeps its
@@ -79,7 +77,7 @@ void esp_get_debug_info(esp_debug_info *out) {
 	out->item_spawn = g_item_spawn;
 	out->item_spawn_alive = unity_object_alive(g_item_spawn);
 	out->item_slot0 = g_item_spawn
-	                      ? *(void **)((uintptr_t)g_item_spawn + ITEMSPAWN_FIRST_ITEM_FIELD)
+	                      ? *(void **)((uintptr_t)g_item_spawn + ITEMSEED_FIRST_ITEM_FIELD)
 	                      : NULL;
 	out->granny_ticks = g_granny_ticks;
 	out->item_ticks = g_item_ticks;
@@ -262,56 +260,47 @@ void esp_collect(void *granny_instance) {
 		}
 	}
 
-	/* Item collection is disabled: see hooked_item_spawn_update() for why
-	 * ItemSpawn can't provide the world's items. */
-	g_item_count = 0;
+	/* Items come from the ItemRepositionSeed instance latched at Awake. */
+	if (esp_items_enabled) {
+		esp_collect_items(g_item_spawn);
+	}
 }
 
 /* Walks ItemSpawn's item pointers. Driven from esp_collect() on the
  * FixedUpdate tick, not from the ItemSpawn hook -- that one only fires on
  * pickup/drop, so positions would almost never refresh. */
-void esp_collect_items(void *item_spawn) {
+void esp_collect_items(void *item_seed) {
 	g_item_count = 0;
 	g_items_alive = 0;
 	g_items_active = 0;
-	/* The instance is latched from a hook that may have fired a level ago,
-	 * so verify it's still alive before touching it. */
-	if (!unity_object_alive(item_spawn)) return;
+	/* Latched at Awake, possibly a level ago -- always re-verify. */
+	if (!unity_object_alive(item_seed)) return;
 
 	uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
 	if (base == 0) return;
 
-	Component_get_transform_t get_transform =
-	    (Component_get_transform_t)(base + OFFSET_GameObject_get_transform);
 	Transform_get_position_t get_position =
 	    (Transform_get_position_t)(base + OFFSET_Transform_get_position);
-	GameObject_get_active_t get_active =
-	    (GameObject_get_active_t)(base + OFFSET_GameObject_get_activeInHierarchy);
 
 	int limit = esp_item_scan_limit;
 	if (limit < 0) limit = 0;
-	if (limit > ITEMSPAWN_ITEM_COUNT) limit = ITEMSPAWN_ITEM_COUNT;
+	if (limit > ITEMSEED_ITEM_COUNT) limit = ITEMSEED_ITEM_COUNT;
 
 	for (int i = 0; i < limit; i++) {
-		void *object = *(void **)((uintptr_t)item_spawn + ITEMSPAWN_FIRST_ITEM_FIELD + i * 8);
+		/* These are Transforms, so no GetComponent hop is needed. */
+		void *transform = *(void **)((uintptr_t)item_seed + ITEMSEED_FIRST_ITEM_FIELD + i * 8);
 
 		if (esp_items_verbose) {
 			char line[160];
-			wsprintfA(line, "[esp] slot %d %s ptr=%p", i, g_item_names[i], object);
+			wsprintfA(line, "[esp] slot %d %s tf=%p", i, g_item_names[i], transform);
 			OutputDebugStringA(line);
 		}
 
-		/* Destroyed items keep a non-NULL managed wrapper, so a plain NULL
-		 * check isn't enough -- this is what was crashing the game. */
-		if (!unity_object_alive(object)) continue;
-		g_items_alive++;
-		/* Already picked up (or not spawned for this run's layout). */
-		bool active = get_active(object, NULL);
-		if (active) g_items_active++;
-		if (!active && !esp_items_ignore_active) continue;
-
-		void *transform = get_transform(object, NULL);
+		/* A collected item's Transform is destroyed but its managed wrapper
+		 * survives, so a plain NULL check would let a dead object through. */
 		if (!unity_object_alive(transform)) continue;
+		g_items_alive++;
+		g_items_active++;
 
 		esp_vec3 position;
 		get_position(&position, transform, NULL);
@@ -322,48 +311,41 @@ void esp_collect_items(void *item_spawn) {
 	}
 }
 
-static ItemSpawn_Update_t original_item_spawn_update = NULL;
+static ItemRepositionSeed_Awake_t original_item_seed_awake = NULL;
 
-static void __fastcall hooked_item_spawn_update(void *instance) {
+/* ItemSpawn::Update is deliberately NOT hooked any more. It isn't a
+ * registry: it activates one item chosen by CountItem, throws it, unparents
+ * it, then calls Destroy(this.gameObject) on itself. Latching that pointer
+ * was a use-after-free -- once the GC reused the block the m_CachedPtr check
+ * passed on unrelated data and we read 55 garbage pointers out of it, which
+ * is what crashed the game on version 1.8. ItemRepositionSeed holds the
+ * level's actual items and persists, so it's hooked instead. */
+static void __fastcall hooked_item_seed_awake(void *instance) {
 	g_item_ticks++;
-	/* Deliberately NOT latching the instance any more.
-	 *
-	 * Decompiling ItemSpawn::Update showed it isn't an item registry at all:
-	 * it activates ONE item chosen by CountItem, throws it with AddForce,
-	 * unparents it, then calls Destroy(this.gameObject) on itself. So every
-	 * instance is a one-shot spawner that dies during its first Update.
-	 *
-	 * Holding that pointer was a use-after-free: once the GC reused the
-	 * block, the m_CachedPtr check would pass on unrelated data and we'd
-	 * read 55 garbage "pointers" out of it and call into them. That is what
-	 * crashed on game version 1.8, where many spawners run at level start.
-	 *
-	 * The real world items are the objects these spawners activate and
-	 * unparent, which have to be found some other way. */
-	(void)instance;
-	original_item_spawn_update(instance);
+	g_item_spawn = instance;
+	original_item_seed_awake(instance);
 }
 
 int esp_install_hooks(void) {
 	uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
 	if (base == 0) {
-		OutputDebugStringA("[cheat] GameAssembly.dll not loaded, cannot hook ItemSpawn::Update");
+		OutputDebugStringA("[cheat] GameAssembly.dll not loaded, cannot hook ItemRepositionSeed::Awake");
 		return 0;
 	}
 
-	void *target = (void *)(base + OFFSET_ItemSpawn_Update);
+	void *target = (void *)(base + OFFSET_ItemRepositionSeed_Awake);
 
-	if (MH_CreateHook(target, (void *)&hooked_item_spawn_update,
-	                  (void **)&original_item_spawn_update) != MH_OK) {
-		OutputDebugStringA("[cheat] MH_CreateHook(ItemSpawn::Update) failed");
+	if (MH_CreateHook(target, (void *)&hooked_item_seed_awake,
+	                  (void **)&original_item_seed_awake) != MH_OK) {
+		OutputDebugStringA("[cheat] MH_CreateHook(ItemRepositionSeed::Awake) failed");
 		return 0;
 	}
 	if (MH_EnableHook(target) != MH_OK) {
-		OutputDebugStringA("[cheat] MH_EnableHook(ItemSpawn::Update) failed");
+		OutputDebugStringA("[cheat] MH_EnableHook(ItemRepositionSeed::Awake) failed");
 		return 0;
 	}
 
-	OutputDebugStringA("[cheat] ItemSpawn::Update hooked");
+	OutputDebugStringA("[cheat] ItemRepositionSeed::Awake hooked");
 	return 1;
 }
 

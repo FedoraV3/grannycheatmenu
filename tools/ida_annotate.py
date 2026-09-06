@@ -184,6 +184,40 @@ ANNOTATIONS = [
         "Inventory/ItemDefs, which describe held items (name, hand model,\n"
         "pickup sound), not world positions.",
     ),
+    (
+        0x245DC0,
+        "ItemRepositionSeed__Awake",
+        "void __fastcall f(void *__this);",
+        "ItemRepositionSeed::Awake -- hooked to capture the object that DOES\n"
+        "hold the level's items, after ItemSpawn turned out to be a dead end.\n"
+        "\n"
+        "The class holds 35 Transform* fields, one per real game item, laid\n"
+        "out contiguously 8 bytes apart:\n"
+        "\n"
+        "  +0x28 Pliers        +0x80 RedCog       +0xD8 Book\n"
+        "  +0x30 MasterKey     +0x88 OrangeCog    +0xE0 Meat\n"
+        "  +0x38 Hammer        +0x90 Barrel       +0xE8 SPKey\n"
+        "  +0x40 PDKey         +0x98 Buttstock    +0xF0 Remote\n"
+        "  +0x48 Code          +0xA0 Trigger      +0xF8 BirdSeed\n"
+        "  +0x50 SafeKey       +0xA8 CarKey       +0x100 WheelCrank\n"
+        "  +0x58 WPKey         +0xB0 SparkPlug    +0x108 ChainCutter\n"
+        "  +0x60 Battery       +0xB8 Gas          +0x110 WoodenStick\n"
+        "  +0x68 Winch         +0xC0 Engine       +0x118 RustyKey\n"
+        "  +0x70 Melon         +0xC8 CarBattery   +0x120 RoboData\n"
+        "  +0x78 PlayHouseKey  +0xD0 Wrench       +0x128 Baton\n"
+        "                                         +0x130 ECKey\n"
+        "                                         +0x138 Fuse\n"
+        "\n"
+        "Why this and not ItemSpawn: it's a persistent level fixture (it also\n"
+        "has OnTriggerEnter) rather than something that destroys itself, and\n"
+        "the fields are Transforms, so reading a position is one\n"
+        "Transform::get_position call with no GetComponent hop. A collected\n"
+        "item's Transform is destroyed, so the m_CachedPtr liveness check\n"
+        "alone filters picked-up items -- no activeInHierarchy call needed.\n"
+        "\n"
+        "Awake fires once per level load, so latching `this` here self-heals\n"
+        "across reloads. Confirmed working in game.",
+    ),
     # ---- UnityEngine: trailing MethodInfo*, NULL is accepted -------------
     (
         0x71D550,
