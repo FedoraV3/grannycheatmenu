@@ -215,6 +215,11 @@ static void draw_visuals_tab() {
 	ImGui::Checkbox("Granny ESP", &esp_granny_enabled);
 	ImGui::Checkbox("Item ESP", &esp_items_enabled);
 
+	/* Her model's real height in world units isn't something we can read
+	 * cheaply, so tune the box by eye instead of rebuilding to guess. */
+	ImGui::SliderFloat("Box height", &esp_box_height, 0.5f, 5.0f, "%.2f");
+	ImGui::SliderFloat("Box width", &esp_box_width_ratio, 0.1f, 1.5f, "%.2f");
+
 	ImGui::Separator();
 	ImGui::TextDisabled("Planned");
 	wip_checkbox("Fullbright", &wip_fullbright);
@@ -247,6 +252,15 @@ static void draw_debug_tab() {
 	} else {
 		ImGui::TextDisabled("AI_Granny inst.   <none ticking yet>");
 	}
+
+	esp_debug_info esp;
+	esp_get_debug_info(&esp);
+	ImGui::Separator();
+	ImGui::Text("FixedUpdate hook   %lu ticks", esp.granny_ticks);
+	ImGui::Text("ItemSpawn hook     %lu ticks", esp.item_ticks);
+	ImGui::Text("camera matrix      %s", esp.have_view_projection ? "ok" : "MISSING");
+	ImGui::Text("granny position    %s", esp.have_granny_position ? "ok" : "MISSING");
+	ImGui::Text("items visible      %d", esp.item_count);
 
 	ImGui::Separator();
 	if (ImGui::BeginTable("offsets", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {

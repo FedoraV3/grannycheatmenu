@@ -12,6 +12,11 @@ bool esp_granny_enabled = false;
 bool esp_items_enabled = false;
 bool esp_fullbright_enabled = false;
 
+/* Tuned by eye in game -- Granny's model is a good deal taller in world
+ * units than a stock Unity humanoid, hence the large height. */
+float esp_box_height = 4.65f;
+float esp_box_width_ratio = 0.50f;
+
 static esp_mat4 g_view_projection;
 static bool g_have_view_projection = false;
 
@@ -39,6 +44,18 @@ typedef struct {
 static esp_item g_items[ITEMSPAWN_ITEM_COUNT];
 static int g_item_count = 0;
 
+static unsigned long g_granny_ticks = 0;
+static unsigned long g_item_ticks = 0;
+
+void esp_get_debug_info(esp_debug_info *out) {
+	if (!out) return;
+	out->have_view_projection = g_have_view_projection;
+	out->have_granny_position = g_have_granny_position;
+	out->item_count = g_item_count;
+	out->granny_ticks = g_granny_ticks;
+	out->item_ticks = g_item_ticks;
+}
+
 void esp_set_view_projection(const esp_mat4 *vp) {
 	if (vp) {
 		g_view_projection = *vp;
@@ -57,6 +74,12 @@ bool esp_world_to_screen(esp_vec3 world, float *out_x, float *out_y) {
 	float clip_y = m[1][0] * world.x + m[1][1] * world.y + m[1][2] * world.z + m[1][3];
 	float clip_w = m[3][0] * world.x + m[3][1] * world.y + m[3][2] * world.z + m[3][3];
 
+	/* NaN compares false against everything, so it would slip past every
+	 * range check below and reach ImGui as a garbage vertex -- which blows
+	 * out the draw list's 16-bit index buffer and trips an assert deep
+	 * inside ImGui rather than here. Reject it explicitly. */
+	if (!isfinite(clip_x) || !isfinite(clip_y) || !isfinite(clip_w)) return false;
+
 	/* Behind the camera (or right on the plane) -- projecting would mirror
 	 * the point to the wrong side of the screen. */
 	if (clip_w < 0.1f) return false;
@@ -68,6 +91,7 @@ bool esp_world_to_screen(esp_vec3 world, float *out_x, float *out_y) {
 	float x = (screen.x * 0.5f) * (1.0f + ndc_x);
 	float y = (screen.y * 0.5f) * (1.0f - ndc_y);
 
+	if (!isfinite(x) || !isfinite(y)) return false;
 	if (x < 0.0f || y < 0.0f || x > screen.x || y > screen.y) return false;
 
 	*out_x = x;
@@ -86,7 +110,7 @@ static void draw_entity(esp_vec3 feet, float height, const char *label, ImU32 co
 	if (!esp_world_to_screen(head, &head_x, &head_y)) return;
 
 	float box_height = foot_y - head_y;
-	float box_width = box_height * 0.45f;
+	float box_width = box_height * esp_box_width_ratio;
 
 	ImDrawList *draw = ImGui::GetBackgroundDrawList();
 	ImVec2 top_left(foot_x - box_width * 0.5f, head_y);
@@ -121,12 +145,29 @@ static void multiply_unity_matrices(const float *a, const float *b, esp_mat4 *ou
 	}
 }
 
+/* Camera.main returns NULL unless the game tags its camera "MainCamera",
+ * which plenty of Unity games never bother to do -- so fall back to walking
+ * AI_Granny -> PlayerStatus -> PlayerCam, which is two pointer derefs and
+ * depends on no tags or IL2CPP calls at all. */
+static void *resolve_camera(uintptr_t base) {
+	void *camera = ((Camera_get_main_t)(base + OFFSET_Camera_get_main))(NULL);
+	if (camera) return camera;
+
+	void *granny = ai_granny_current();
+	if (!granny) return NULL;
+
+	void *player_status = *(void **)((uintptr_t)granny + FIELD_AI_Granny_PlayerStatus);
+	if (!player_status) return NULL;
+
+	return *(void **)((uintptr_t)player_status + FIELD_PlayerStatus_PlayerCam);
+}
+
 /* Main thread only. Refreshed from both hooks so the overlay still has a
  * camera when only one of them is ticking. */
 static bool refresh_camera(uintptr_t base) {
-	void *camera = ((Camera_get_main_t)(base + OFFSET_Camera_get_main))(NULL);
+	void *camera = resolve_camera(base);
 	if (!camera) {
-		/* No main camera right now (menu screen, loading, scene swap). */
+		/* No camera reachable right now (menu screen, loading, scene swap). */
 		esp_set_view_projection(NULL);
 		return false;
 	}
@@ -140,11 +181,34 @@ static bool refresh_camera(uintptr_t base) {
 
 	esp_mat4 view_projection;
 	multiply_unity_matrices(projection, world_to_camera, &view_projection);
+
+	/* Sanity-check what came back before trusting it. An all-zero or
+	 * non-finite matrix means the camera wasn't really initialised (or the
+	 * calling convention is wrong) -- better to report no camera than to
+	 * feed garbage into the projection. */
+	bool any_nonzero = false;
+	for (int row = 0; row < 4; row++) {
+		for (int col = 0; col < 4; col++) {
+			float value = view_projection.m[row][col];
+			if (!isfinite(value)) {
+				esp_set_view_projection(NULL);
+				return false;
+			}
+			if (value != 0.0f) any_nonzero = true;
+		}
+	}
+	if (!any_nonzero) {
+		esp_set_view_projection(NULL);
+		return false;
+	}
+
 	esp_set_view_projection(&view_projection);
 	return true;
 }
 
 void esp_collect(void *granny_instance) {
+	g_granny_ticks++;
+
 	/* Don't pay for IL2CPP calls every physics tick when nothing is drawn. */
 	if (!esp_granny_enabled && !esp_items_enabled) return;
 
@@ -204,6 +268,8 @@ void esp_collect_items(void *item_spawn) {
 static ItemSpawn_Update_t original_item_spawn_update = NULL;
 
 static void __fastcall hooked_item_spawn_update(void *instance) {
+	g_item_ticks++;
+
 	/* Per-frame and independent of whether Granny is alive, so this is the
 	 * better place to refresh the camera than the 50Hz FixedUpdate hook. */
 	if (esp_granny_enabled || esp_items_enabled) {
@@ -255,7 +321,7 @@ void esp_render(void) {
 
 	if (esp_granny_enabled && g_have_granny_position) {
 		/* Her transform sits at her feet, so the box grows upward. */
-		draw_entity(g_granny_position, 1.8f, "Granny", IM_COL32(255, 64, 64, 255));
+		draw_entity(g_granny_position, esp_box_height, "Granny", IM_COL32(255, 64, 64, 255));
 	}
 
 	if (esp_items_enabled) {

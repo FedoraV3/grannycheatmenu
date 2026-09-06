@@ -126,6 +126,7 @@ static const uintptr_t FIELD_AI_Granny_Walk_Speed         = 0x94;  /**< float */
 static const uintptr_t FIELD_AI_Granny_Run_Speed          = 0x98;  /**< float */
 static const uintptr_t FIELD_AI_Granny_Agent              = 0xA8;  /**< NavMeshAgent* */
 static const uintptr_t FIELD_AI_Granny_Player             = 0xD0;  /**< Transform* */
+static const uintptr_t FIELD_AI_Granny_PlayerStatus       = 0xE8;  /**< PlayerStatus* */
 static const uintptr_t FIELD_AI_Granny_IsDying            = 0x138; /**< bool */
 static const uintptr_t FIELD_AI_Granny_IsBlind            = 0x164; /**< bool -- the game's own blind flag */
 static const uintptr_t FIELD_AI_Granny_BlindTimer         = 0x168; /**< float */
@@ -138,6 +139,17 @@ static const uintptr_t FIELD_AI_Granny_IsWalking          = 0x18E; /**< bool */
 static const uintptr_t FIELD_AI_Granny_IsIdle             = 0x18F; /**< bool */
 static const uintptr_t FIELD_AI_Granny_DistanceFromPlayer = 0x1BC; /**< float */
 static const uintptr_t FIELD_AI_Granny_PlayerPos          = 0x288; /**< Vector3 */
+
+/*
+ * PlayerStatus instance fields.
+ */
+/**
+ * PlayerStatus::PlayerCam -- the player's Camera. Reaching it as
+ * AI_Granny(+0xE8) -> PlayerStatus(+0x110) is more reliable than
+ * Camera.main, which returns NULL unless the game tags its camera
+ * "MainCamera", and needs no IL2CPP call at all.
+ */
+static const uintptr_t FIELD_PlayerStatus_PlayerCam       = 0x110; /**< Camera* */
 
 /*
  * UnityEngine methods -- IL2CPP compiles the engine's own assemblies into

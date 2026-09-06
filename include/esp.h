@@ -20,6 +20,15 @@ extern bool esp_items_enabled;
 extern bool esp_fullbright_enabled;
 
 /**
+ * Box dimensions for the Granny marker, in world units. Her transform sits
+ * at her feet, so the box is drawn from there upward by esp_box_height.
+ * Tunable at runtime because the right value depends on the model's actual
+ * scale, which is easier to eyeball in game than to derive.
+ */
+extern float esp_box_height;
+extern float esp_box_width_ratio;
+
+/**
  * @brief Feed the camera's view-projection matrix for this frame.
  *
  * Unity's `Camera.projectionMatrix * Camera.worldToCameraMatrix`. Must be
@@ -84,6 +93,26 @@ void esp_collect_items(void *item_spawn);
  * @return Nonzero on success.
  */
 int esp_install_hooks(void);
+
+/** Snapshot of the ESP's internal state, for the menu's Debug tab. */
+typedef struct {
+	bool have_view_projection;  /**< A camera matrix has been captured. */
+	bool have_granny_position;  /**< Granny's transform position was read. */
+	int item_count;             /**< Items found still active last collect. */
+	unsigned long granny_ticks; /**< AI_Granny::FixedUpdate hook call count. */
+	unsigned long item_ticks;   /**< ItemSpawn::Update hook call count. */
+} esp_debug_info;
+
+/**
+ * @brief Read the ESP's current state.
+ *
+ * Tells you which stage of the pipeline is failing: zero ticks means the
+ * relevant hook never fired, ticks without a view projection means the
+ * camera couldn't be resolved, and so on.
+ *
+ * @param out Receives the snapshot.
+ */
+void esp_get_debug_info(esp_debug_info *out);
 
 /**
  * @brief Draw the enabled overlays for this frame.
