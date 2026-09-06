@@ -1,6 +1,6 @@
-#include "esp.h"
-#include "ai_granny_hook.h"
-#include "offsets.h"
+#include "overlay/esp.h"
+#include "game/ai_granny_hook.h"
+#include "game/offsets.h"
 #include "MinHook.h"
 
 #include <windows.h>

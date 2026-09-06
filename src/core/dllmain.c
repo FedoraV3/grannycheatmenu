@@ -1,9 +1,9 @@
 #include <windows.h>
-#include "patch_local.h"
-#include "offsets.h"
-#include "d3d11_hook.h"
-#include "ai_granny_hook.h"
-#include "esp.h"
+#include "core/patch_local.h"
+#include "game/offsets.h"
+#include "overlay/d3d11_hook.h"
+#include "game/ai_granny_hook.h"
+#include "overlay/esp.h"
 
 /**
  * @brief Poll for a module to appear, in case we're mapped in before it loads.

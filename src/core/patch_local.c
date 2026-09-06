@@ -1,4 +1,4 @@
-#include "patch_local.h"
+#include "core/patch_local.h"
 #include <string.h>
 
 static int matches_at(const uint8_t *buf, const uint8_t *pattern,

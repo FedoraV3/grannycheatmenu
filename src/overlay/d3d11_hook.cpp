@@ -1,7 +1,7 @@
-#include "d3d11_hook.h"
-#include "ai_granny_hook.h"
-#include "offsets.h"
-#include "esp.h"
+#include "overlay/d3d11_hook.h"
+#include "game/ai_granny_hook.h"
+#include "game/offsets.h"
+#include "overlay/esp.h"
 #include "MinHook.h"
 
 #include <windows.h>

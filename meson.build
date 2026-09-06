@@ -37,7 +37,24 @@ dxgi_dep = cpp.find_library('dxgi')
 d3dcompiler_dep = cpp.find_library('d3dcompiler')   # D3DCompile, used by ImGui's DX11 backend for its shaders
 dwmapi_dep = cpp.find_library('dwmapi')             # Dwm* calls, used by ImGui's Win32 backend
 
-shared_library('cheat', ['src/dllmain.c', 'src/patch_local.c', 'src/d3d11_hook.cpp', 'src/ai_granny_hook.c', 'src/esp.cpp'],
+# Sources are grouped by role, and includes are path-qualified to match
+# ("game/offsets.h" rather than "offsets.h"), so each include states which
+# layer it reaches into.
+#
+#   core    -- entry point and game-agnostic memory utilities
+#   game    -- IL2CPP offsets and the hooks onto Granny's own classes
+#   overlay -- the D3D11 present hook, ImGui menu, and ESP rendering
+cheat_sources = [
+    'src/core/dllmain.c',
+    'src/core/patch_local.c',
+
+    'src/game/ai_granny_hook.c',
+
+    'src/overlay/d3d11_hook.cpp',
+    'src/overlay/esp.cpp',
+]
+
+shared_library('cheat', cheat_sources,
     include_directories: [include_directories('include'), minhook_inc, imgui_inc],
     link_with: [minhook_lib, imgui_lib],
     dependencies: [d3d11_dep, dxgi_dep, d3dcompiler_dep, dwmapi_dep],

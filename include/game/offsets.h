@@ -183,8 +183,20 @@ static const uintptr_t FIELD_AI_Granny_Agent              = 0xA8;  /**< NavMeshA
 static const uintptr_t FIELD_AI_Granny_Player             = 0xD0;  /**< Transform* */
 static const uintptr_t FIELD_AI_Granny_PlayerStatus       = 0xE8;  /**< PlayerStatus* */
 static const uintptr_t FIELD_AI_Granny_IsDying            = 0x138; /**< bool */
+static const uintptr_t FIELD_AI_Granny_EnemyVision        = 0x108; /**< Eyes_Granny* -- her sight component */
 static const uintptr_t FIELD_AI_Granny_IsBlind            = 0x164; /**< bool -- the game's own blind flag */
-static const uintptr_t FIELD_AI_Granny_BlindTimer         = 0x168; /**< float */
+static const uintptr_t FIELD_AI_Granny_BlindTimer         = 0x168; /**< float -- counts the blind state down */
+
+/*
+ * Hearing. Note there is NO IsDeaf flag to match IsBlind -- deafness has to
+ * be synthesised from these (clear IsFollowingSound/NoiseObj each tick, pin
+ * the timers, or intercept whatever sets them). MurderNoiseObjs (0x1C1510)
+ * works on the same tag system and is worth reading first.
+ */
+static const uintptr_t FIELD_AI_Granny_TimerNearNoise     = 0x190; /**< float */
+static const uintptr_t FIELD_AI_Granny_TimerMaxNoise      = 0x194; /**< float */
+static const uintptr_t FIELD_AI_Granny_NoiseObj           = 0x1E8; /**< GameObject* -- what she's heading toward */
+static const uintptr_t FIELD_AI_Granny_NoiseObjectTag     = 0x1F8; /**< System.String* */
 static const uintptr_t FIELD_AI_Granny_CaughtPlayer       = 0x188; /**< bool */
 static const uintptr_t FIELD_AI_Granny_IsSearching        = 0x18A; /**< bool */
 static const uintptr_t FIELD_AI_Granny_IsAngry            = 0x18B; /**< bool */
