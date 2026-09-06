@@ -130,6 +130,25 @@ typedef granny_method_t ItemSpawn_Update_t;
 static const uintptr_t OFFSET_ItemRepositionSeed_Awake        = 0x245DC0;
 typedef granny_method_t ItemRepositionSeed_Awake_t;
 
+/**
+ * PickRay::Update -- the player's interaction script (pickup raycast, drop,
+ * shoot), hooked as the ESP's primary per-frame main-thread tick.
+ *
+ * This exists whenever the player does, which matters because Granny can be
+ * switched off in the game's own options -- AI_Granny::FixedUpdate then
+ * never runs, and anything driven off it silently stops. PickRay also
+ * carries PlayerStatus, giving a route to the camera that doesn't go
+ * through Granny at all.
+ *
+ * Huge function (9444 instructions) but we only detour its entry.
+ * Game-assembly method: single argument, no trailing MethodInfo*.
+ */
+static const uintptr_t OFFSET_PickRay_Update                  = 0x237CE0;
+typedef granny_method_t PickRay_Update_t;
+
+/** PickRay::PlayerStatus -- the Granny-independent path to PlayerCam. */
+static const uintptr_t FIELD_PickRay_PlayerStatus             = 0x88;
+
 /*
  * ItemRepositionSeed's item references: 35 Transform* fields laid out
  * contiguously from `Pliers` at 0x28 through `Fuse` at 0x138, 8 bytes

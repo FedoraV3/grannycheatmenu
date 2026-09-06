@@ -132,7 +132,8 @@ typedef struct {
 	void *item_spawn;           /**< The captured instance pointer itself. */
 	void *item_slot0;           /**< Raw pointer in the first item field (+0x28). */
 	unsigned long granny_ticks; /**< AI_Granny::FixedUpdate hook call count. */
-	unsigned long item_ticks;   /**< ItemSpawn::Update hook call count. */
+	unsigned long item_ticks;   /**< ItemRepositionSeed::Awake hook call count. */
+	unsigned long pickray_ticks;/**< PickRay::Update hook call count (primary tick). */
 } esp_debug_info;
 
 /**

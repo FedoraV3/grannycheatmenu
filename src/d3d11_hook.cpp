@@ -270,7 +270,8 @@ static void draw_debug_tab() {
 	esp_get_debug_info(&esp);
 	ImGui::Separator();
 	ImGui::Text("FixedUpdate hook   %lu ticks", esp.granny_ticks);
-	ImGui::Text("ItemSpawn hook     %lu ticks", esp.item_ticks);
+	ImGui::Text("PickRay hook       %lu ticks", esp.pickray_ticks);
+	ImGui::Text("ItemSeed Awake     %lu ticks", esp.item_ticks);
 	ImGui::Text("camera matrix      %s", esp.have_view_projection ? "ok" : "MISSING");
 	ImGui::Text("granny position    %s", esp.have_granny_position ? "ok" : "MISSING");
 	ImGui::Text("ItemSeed instance  %s  0x%llX",

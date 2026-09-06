@@ -50,11 +50,16 @@ static int g_items_active = 0;
 
 static unsigned long g_granny_ticks = 0;
 static unsigned long g_item_ticks = 0;
+static unsigned long g_pickray_ticks = 0;
 
 /* The ItemRepositionSeed instance, latched at its Awake. It holds the
  * level's 35 item Transforms and persists, unlike ItemSpawn which destroys
  * itself. Walked on the FixedUpdate tick. */
 static void *volatile g_item_spawn = NULL;
+
+/* The player's PickRay, latched from its Update. Drives the ESP whenever
+ * Granny is switched off and AI_Granny::FixedUpdate never fires. */
+static void *volatile g_pickray = NULL;
 
 /* A UnityEngine.Object whose native side has been destroyed keeps its
  * managed wrapper, so the pointer still looks valid from C -- only
@@ -81,6 +86,7 @@ void esp_get_debug_info(esp_debug_info *out) {
 	                      : NULL;
 	out->granny_ticks = g_granny_ticks;
 	out->item_ticks = g_item_ticks;
+	out->pickray_ticks = g_pickray_ticks;
 }
 
 void esp_set_view_projection(const esp_mat4 *vp) {
@@ -172,22 +178,40 @@ static void multiply_unity_matrices(const float *a, const float *b, esp_mat4 *ou
 	}
 }
 
-/* Camera.main returns NULL unless the game tags its camera "MainCamera",
- * which plenty of Unity games never bother to do -- so fall back to walking
- * AI_Granny -> PlayerStatus -> PlayerCam, which is two pointer derefs and
- * depends on no tags or IL2CPP calls at all. */
+/* PlayerStatus holds PlayerCam, so any object that references PlayerStatus
+ * is a route to the camera. */
+static void *camera_via_player_status(void *player_status) {
+	if (!unity_object_alive(player_status)) return NULL;
+	void *camera = *(void **)((uintptr_t)player_status + FIELD_PlayerStatus_PlayerCam);
+	return unity_object_alive(camera) ? camera : NULL;
+}
+
+/* Three routes, cheapest and most reliable first:
+ *
+ *   1. Camera.main -- returns NULL in this game, which never tags its
+ *      camera "MainCamera", but costs nothing to try.
+ *   2. PickRay -> PlayerStatus -> PlayerCam. PickRay is the player's own
+ *      script, so this works even with Granny switched off in the game
+ *      options (which is exactly when route 3 dies).
+ *   3. AI_Granny -> PlayerStatus -> PlayerCam, as a last resort.
+ *
+ * Routes 2 and 3 are pure pointer derefs -- no tags, no IL2CPP calls. */
 static void *resolve_camera(uintptr_t base) {
 	void *camera = ((Camera_get_main_t)(base + OFFSET_Camera_get_main))(NULL);
 	if (unity_object_alive(camera)) return camera;
 
+	void *pickray = g_pickray;
+	if (unity_object_alive(pickray)) {
+		camera = camera_via_player_status(
+		    *(void **)((uintptr_t)pickray + FIELD_PickRay_PlayerStatus));
+		if (camera) return camera;
+	}
+
 	void *granny = ai_granny_current();
 	if (!unity_object_alive(granny)) return NULL;
 
-	void *player_status = *(void **)((uintptr_t)granny + FIELD_AI_Granny_PlayerStatus);
-	if (!unity_object_alive(player_status)) return NULL;
-
-	camera = *(void **)((uintptr_t)player_status + FIELD_PlayerStatus_PlayerCam);
-	return unity_object_alive(camera) ? camera : NULL;
+	return camera_via_player_status(
+	    *(void **)((uintptr_t)granny + FIELD_AI_Granny_PlayerStatus));
 }
 
 /* Main thread only. Refreshed from both hooks so the overlay still has a
@@ -260,10 +284,8 @@ void esp_collect(void *granny_instance) {
 		}
 	}
 
-	/* Items come from the ItemRepositionSeed instance latched at Awake. */
-	if (esp_items_enabled) {
-		esp_collect_items(g_item_spawn);
-	}
+	/* Items are collected on the PickRay tick instead -- that one keeps
+	 * running when Granny is switched off, and this hook doesn't. */
 }
 
 /* Walks ItemSpawn's item pointers. Driven from esp_collect() on the
@@ -326,6 +348,28 @@ static void __fastcall hooked_item_seed_awake(void *instance) {
 	original_item_seed_awake(instance);
 }
 
+static PickRay_Update_t original_pickray_update = NULL;
+
+/* The ESP's primary tick. Runs every frame on the main thread for as long
+ * as the player exists, which -- unlike AI_Granny::FixedUpdate -- keeps
+ * working when Granny is disabled in the game's options. */
+static void __fastcall hooked_pickray_update(void *instance) {
+	g_pickray_ticks++;
+	g_pickray = instance;
+
+	if (esp_granny_enabled || esp_items_enabled) {
+		uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
+		if (base != 0) {
+			refresh_camera(base);
+			if (esp_items_enabled) {
+				esp_collect_items(g_item_spawn);
+			}
+		}
+	}
+
+	original_pickray_update(instance);
+}
+
 int esp_install_hooks(void) {
 	uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
 	if (base == 0) {
@@ -345,7 +389,18 @@ int esp_install_hooks(void) {
 		return 0;
 	}
 
-	OutputDebugStringA("[cheat] ItemRepositionSeed::Awake hooked");
+	void *pickray_target = (void *)(base + OFFSET_PickRay_Update);
+	if (MH_CreateHook(pickray_target, (void *)&hooked_pickray_update,
+	                  (void **)&original_pickray_update) != MH_OK) {
+		OutputDebugStringA("[cheat] MH_CreateHook(PickRay::Update) failed");
+		return 0;
+	}
+	if (MH_EnableHook(pickray_target) != MH_OK) {
+		OutputDebugStringA("[cheat] MH_EnableHook(PickRay::Update) failed");
+		return 0;
+	}
+
+	OutputDebugStringA("[cheat] ItemRepositionSeed::Awake + PickRay::Update hooked");
 	return 1;
 }
 
