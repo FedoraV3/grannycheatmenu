@@ -1,6 +1,7 @@
 #include "d3d11_hook.h"
 #include "ai_granny_hook.h"
 #include "offsets.h"
+#include "esp.h"
 #include "MinHook.h"
 
 #include <windows.h>
@@ -32,8 +33,27 @@ static WNDPROC g_original_wndproc = nullptr;
 static bool g_imgui_initialized = false;
 static bool g_menu_visible = false;
 
+/* Implemented. */
 bool granny_cannot_kill_you = false;
 bool stop_granny_ai = false;
+
+/* WIP -- these are UI placeholders only. Nothing is wired up behind them
+ * yet, so they render greyed out via wip_checkbox()/wip_slider() below.
+ * Drop the wip_ prefix and move them up to the block above as each one
+ * gets an actual implementation. */
+static bool wip_noclip = false;
+static bool wip_infinite_jump = false;
+static float wip_player_speed = 1.0f;
+
+static bool wip_granny_blind = false;
+static bool wip_granny_deaf = false;
+static bool wip_freeze_in_place = false;
+static float wip_granny_speed = 1.0f;
+
+static bool wip_reveal_items = false;
+static bool wip_disable_traps = false;
+
+static bool wip_fullbright = false;
 
 static void create_render_target(IDXGISwapChain *swap_chain) {
     ID3D11Texture2D *back_buffer = nullptr;
@@ -108,9 +128,27 @@ static void init_imgui(IDXGISwapChain *swap_chain) {
     OutputDebugStringA("[cheat] ImGui initialized (Insert to toggle menu)");
 }
 
-static void draw_menu() {
-    ImGui::Begin("grannycheat");
+/* Greyed-out widgets for features that have UI but no implementation yet.
+ * Disabled rather than hidden so the roadmap is visible in-game. */
+static void wip_checkbox(const char *label, bool *value) {
+	ImGui::BeginDisabled();
+	ImGui::Checkbox(label, value);
+	ImGui::EndDisabled();
+	if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+		ImGui::SetTooltip("Not implemented yet");
+	}
+}
 
+static void wip_slider(const char *label, float *value, float min, float max) {
+	ImGui::BeginDisabled();
+	ImGui::SliderFloat(label, value, min, max, "%.2fx");
+	ImGui::EndDisabled();
+	if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+		ImGui::SetTooltip("Not implemented yet");
+	}
+}
+
+static void draw_player_tab() {
 	if (ImGui::Checkbox("Granny cannot kill you", &granny_cannot_kill_you)) {
 		uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
 		if (granny_cannot_kill_you) {
@@ -127,7 +165,15 @@ static void draw_menu() {
 			MH_DisableHook(reinterpret_cast<LPVOID>(base + OFFSET_PlayerStatus_NormalDeath));
 		}
 	}
-	
+
+	ImGui::Separator();
+	ImGui::TextDisabled("Planned");
+	wip_checkbox("Infinite jump", &wip_infinite_jump);
+	wip_checkbox("Noclip", &wip_noclip);
+	wip_slider("Move speed", &wip_player_speed, 0.5f, 5.0f);
+}
+
+static void draw_granny_tab() {
 	if (ImGui::Checkbox("Stop granny", &stop_granny_ai)) {
 		if (stop_granny_ai) {
 			void *granny = ai_granny_current();
@@ -148,7 +194,102 @@ static void draw_menu() {
 		}
 	}
 
-    ImGui::End();
+	ImGui::Separator();
+	ImGui::TextDisabled("Planned");
+	wip_checkbox("Freeze in place", &wip_freeze_in_place);
+	wip_checkbox("Blind (ignore sight)", &wip_granny_blind);
+	wip_checkbox("Deaf (ignore sound)", &wip_granny_deaf);
+	wip_slider("Granny speed", &wip_granny_speed, 0.1f, 3.0f);
+}
+
+static void draw_world_tab() {
+	ImGui::TextDisabled("Planned");
+	wip_checkbox("Reveal item locations", &wip_reveal_items);
+	wip_checkbox("Disable traps", &wip_disable_traps);
+}
+
+static void draw_visuals_tab() {
+	/* These two are live -- the ESP layer renders as soon as they're on.
+	 * Until the camera matrix is sourced from the game it just draws a
+	 * status line saying so, rather than nothing at all. */
+	ImGui::Checkbox("Granny ESP", &esp_granny_enabled);
+	ImGui::Checkbox("Item ESP", &esp_items_enabled);
+
+	ImGui::Separator();
+	ImGui::TextDisabled("Planned");
+	wip_checkbox("Fullbright", &wip_fullbright);
+}
+
+/* Live state, for working out what's actually resolved at runtime while
+ * reverse engineering. */
+static void draw_debug_tab() {
+	static const struct {
+		const char *name;
+		uintptr_t rva;
+	} offset_table[] = {
+		{ "PlayerStatus::GrannyCaughtYou",    OFFSET_PlayerStatus_GrannyCaughtYou },
+		{ "PlayerStatus::GrannyCaughtYouBed", OFFSET_PlayerStatus_GrannyCaughtYouBed },
+		{ "PlayerStatus::KnockDeath",         OFFSET_PlayerStatus_KnockDeath },
+		{ "PlayerStatus::NormalDeath",        OFFSET_PlayerStatus_NormalDeath },
+		{ "AI_Granny::ResetAIDecision",       OFFSET_AI_Granny_ResetAIDecision },
+		{ "AI_Granny::StopAI",                OFFSET_AI_Granny_StopAI },
+		{ "AI_Granny::ChaseAction",           OFFSET_AI_Granny_ChaseAction },
+		{ "AI_Granny::SmackTimer",            OFFSET_AI_Granny_SmackTimer },
+		{ "AI_Granny::FixedUpdate",           OFFSET_AI_Granny_FixedUpdate },
+	};
+
+	uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
+	void *granny = ai_granny_current();
+
+	ImGui::Text("GameAssembly.dll  0x%llX", (unsigned long long)base);
+	if (granny) {
+		ImGui::Text("AI_Granny inst.   0x%llX", (unsigned long long)(uintptr_t)granny);
+	} else {
+		ImGui::TextDisabled("AI_Granny inst.   <none ticking yet>");
+	}
+
+	ImGui::Separator();
+	if (ImGui::BeginTable("offsets", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+		for (const auto &entry : offset_table) {
+			ImGui::TableNextRow();
+			ImGui::TableNextColumn();
+			ImGui::TextUnformatted(entry.name);
+			ImGui::TableNextColumn();
+			ImGui::Text("0x%llX", (unsigned long long)(base + entry.rva));
+		}
+		ImGui::EndTable();
+	}
+}
+
+static void draw_menu() {
+	ImGui::SetNextWindowSize(ImVec2(440, 340), ImGuiCond_FirstUseEver);
+	ImGui::Begin("grannycheat");
+
+	if (ImGui::BeginTabBar("##tabs")) {
+		if (ImGui::BeginTabItem("Player")) {
+			draw_player_tab();
+			ImGui::EndTabItem();
+		}
+		if (ImGui::BeginTabItem("Granny")) {
+			draw_granny_tab();
+			ImGui::EndTabItem();
+		}
+		if (ImGui::BeginTabItem("World")) {
+			draw_world_tab();
+			ImGui::EndTabItem();
+		}
+		if (ImGui::BeginTabItem("Visuals")) {
+			draw_visuals_tab();
+			ImGui::EndTabItem();
+		}
+		if (ImGui::BeginTabItem("Debug")) {
+			draw_debug_tab();
+			ImGui::EndTabItem();
+		}
+		ImGui::EndTabBar();
+	}
+
+	ImGui::End();
 }
 
 static void render_frame() {
@@ -156,7 +297,12 @@ static void render_frame() {
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    draw_menu();
+    if (g_menu_visible) {
+        draw_menu();
+    }
+    /* ESP draws whether or not the menu is open -- it's meant to be up
+     * while you're actually playing. */
+    esp_render();
 
     ImGui::Render();
     g_context->OMSetRenderTargets(1, &g_render_target, nullptr);
@@ -178,7 +324,8 @@ static HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swap_chain, UINT
     }
     insert_was_down = insert_is_down;
 
-    if (g_menu_visible) {
+    /* Skip the whole ImGui frame when there's nothing to show at all. */
+    if (g_menu_visible || esp_granny_enabled || esp_items_enabled) {
         render_frame();
     }
 

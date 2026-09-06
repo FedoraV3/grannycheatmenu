@@ -37,7 +37,7 @@ dxgi_dep = cpp.find_library('dxgi')
 d3dcompiler_dep = cpp.find_library('d3dcompiler')   # D3DCompile, used by ImGui's DX11 backend for its shaders
 dwmapi_dep = cpp.find_library('dwmapi')             # Dwm* calls, used by ImGui's Win32 backend
 
-shared_library('cheat', ['src/dllmain.c', 'src/patch_local.c', 'src/d3d11_hook.cpp', 'src/ai_granny_hook.c'],
+shared_library('cheat', ['src/dllmain.c', 'src/patch_local.c', 'src/d3d11_hook.cpp', 'src/ai_granny_hook.c', 'src/esp.cpp'],
     include_directories: [include_directories('include'), minhook_inc, imgui_inc],
     link_with: [minhook_lib, imgui_lib],
     dependencies: [d3d11_dep, dxgi_dep, d3dcompiler_dep, dwmapi_dep],

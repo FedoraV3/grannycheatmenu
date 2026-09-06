@@ -3,6 +3,7 @@
 #include "offsets.h"
 #include "d3d11_hook.h"
 #include "ai_granny_hook.h"
+#include "esp.h"
 
 /**
  * @brief Poll for a module to appear, in case we're mapped in before it loads.
@@ -69,6 +70,10 @@ static DWORD WINAPI main_thread(LPVOID param) {
 
     if (!ai_granny_hook_install()) {
         OutputDebugStringA("[cheat] AI_Granny hook failed, no live instance tracking");
+    }
+
+    if (!esp_install_hooks()) {
+        OutputDebugStringA("[cheat] ESP hooks failed, item ESP will have no data");
     }
 
     OutputDebugStringA("[cheat] resolved GameAssembly.dll offsets");

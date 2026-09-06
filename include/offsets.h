@@ -98,3 +98,88 @@ typedef granny_method_t AI_Granny_SmackTimer_t;
  */
 static const uintptr_t OFFSET_AI_Granny_FixedUpdate           = 0x1BDCC0;
 typedef granny_method_t AI_Granny_FixedUpdate_t;
+
+/**
+ * ItemSpawn::Update -- per-frame tick on the object that owns every item
+ * GameObject in the level. Hooked purely to capture the ItemSpawn instance,
+ * same trick as AI_Granny::FixedUpdate. Game-assembly method, so single
+ * argument, no trailing MethodInfo*.
+ */
+static const uintptr_t OFFSET_ItemSpawn_Update                = 0x21F2C0;
+typedef granny_method_t ItemSpawn_Update_t;
+
+/*
+ * ItemSpawn's item pointers: 55 GameObject* fields laid out contiguously
+ * from `crossbow` at 0x28 through `fuse` at 0x1D8, 8 bytes apart, so they
+ * can be walked as an array rather than named one by one. Names for each
+ * slot live in esp.cpp.
+ */
+#define ITEMSPAWN_FIRST_ITEM_FIELD 0x28
+#define ITEMSPAWN_ITEM_COUNT       55
+
+/*
+ * AI_Granny *instance field* offsets (from Il2CppDumper's dump.cs). These
+ * are offsets into the object -- add them to an instance pointer from
+ * ai_granny_current(), NOT to the module base like the RVAs above.
+ */
+static const uintptr_t FIELD_AI_Granny_Walk_Speed         = 0x94;  /**< float */
+static const uintptr_t FIELD_AI_Granny_Run_Speed          = 0x98;  /**< float */
+static const uintptr_t FIELD_AI_Granny_Agent              = 0xA8;  /**< NavMeshAgent* */
+static const uintptr_t FIELD_AI_Granny_Player             = 0xD0;  /**< Transform* */
+static const uintptr_t FIELD_AI_Granny_IsDying            = 0x138; /**< bool */
+static const uintptr_t FIELD_AI_Granny_IsBlind            = 0x164; /**< bool -- the game's own blind flag */
+static const uintptr_t FIELD_AI_Granny_BlindTimer         = 0x168; /**< float */
+static const uintptr_t FIELD_AI_Granny_CaughtPlayer       = 0x188; /**< bool */
+static const uintptr_t FIELD_AI_Granny_IsSearching        = 0x18A; /**< bool */
+static const uintptr_t FIELD_AI_Granny_IsAngry            = 0x18B; /**< bool */
+static const uintptr_t FIELD_AI_Granny_IsFollowingSound   = 0x18C; /**< bool */
+static const uintptr_t FIELD_AI_Granny_IsChasing          = 0x18D; /**< bool */
+static const uintptr_t FIELD_AI_Granny_IsWalking          = 0x18E; /**< bool */
+static const uintptr_t FIELD_AI_Granny_IsIdle             = 0x18F; /**< bool */
+static const uintptr_t FIELD_AI_Granny_DistanceFromPlayer = 0x1BC; /**< float */
+static const uintptr_t FIELD_AI_Granny_PlayerPos          = 0x288; /**< Vector3 */
+
+/*
+ * UnityEngine methods -- IL2CPP compiles the engine's own assemblies into
+ * GameAssembly.dll too, so these live at fixed RVAs just like the game's.
+ *
+ * Unlike the game methods above, these DO take a trailing MethodInfo*.
+ * Passing NULL for it is safe: AI_Granny::StopAI itself calls both
+ * Component::get_transform and Transform::get_position that way (visible
+ * in its decompile as `sub_18071D550(a1, 0)` / `sub_180747310(buf, v5, 0)`).
+ *
+ * Win64 ABI detail: a struct larger than 8 bytes is returned through a
+ * hidden first pointer argument, so for Vector3 (12 bytes) and Matrix4x4
+ * (64 bytes) the return buffer comes first and `this` shifts to the second
+ * parameter. Unity's Matrix4x4 is stored column-major: element (row, col)
+ * is raw[col * 4 + row].
+ */
+
+/** Component::get_transform -- `Transform *f(Component *this, MethodInfo *)`. */
+static const uintptr_t OFFSET_Component_get_transform         = 0x71D550;
+typedef void *(__fastcall *Component_get_transform_t)(void *instance, void *method);
+
+/** Transform::get_position -- `Vector3 *f(Vector3 *ret, Transform *this, MethodInfo *)`. */
+static const uintptr_t OFFSET_Transform_get_position          = 0x747310;
+typedef void *(__fastcall *Transform_get_position_t)(void *ret_vector3, void *instance, void *method);
+
+/** Camera::get_main -- static, `Camera *f(MethodInfo *)`. */
+static const uintptr_t OFFSET_Camera_get_main                 = 0x6FE450;
+typedef void *(__fastcall *Camera_get_main_t)(void *method);
+
+/** Camera::get_worldToCameraMatrix -- `Matrix4x4 *f(Matrix4x4 *ret, Camera *this, MethodInfo *)`. */
+static const uintptr_t OFFSET_Camera_get_worldToCameraMatrix  = 0x6FEA00;
+/** Camera::get_projectionMatrix -- same shape as the above. */
+static const uintptr_t OFFSET_Camera_get_projectionMatrix     = 0x6FE6B0;
+typedef void *(__fastcall *Camera_get_matrix_t)(void *ret_matrix4x4, void *instance, void *method);
+
+/** GameObject::get_transform -- GameObject isn't a Component, so it has its own. */
+static const uintptr_t OFFSET_GameObject_get_transform        = 0x720600;
+
+/**
+ * GameObject::get_activeInHierarchy -- `bool f(GameObject *this, MethodInfo *)`.
+ * Used to skip items that have already been collected (the game deactivates
+ * their GameObject) so the ESP only shows what's still out there.
+ */
+static const uintptr_t OFFSET_GameObject_get_activeInHierarchy = 0x720460;
+typedef bool(__fastcall *GameObject_get_active_t)(void *instance, void *method);

@@ -1,5 +1,6 @@
 #include "ai_granny_hook.h"
 #include "offsets.h"
+#include "esp.h"
 #include "MinHook.h"
 
 #include <windows.h>
@@ -14,6 +15,12 @@ static uintptr_t g_gameassembly_base = 0;
 
 static void __fastcall hooked_fixed_update(void *instance) {
     g_granny_instance = instance;
+
+    /* This runs on the game's main thread, which is the only safe place to
+     * call into IL2CPP -- so ESP gathers its camera/position data here and
+     * the render thread just draws the cached results. */
+    esp_collect(instance);
+
     original_fixed_update(instance);
 }
 
