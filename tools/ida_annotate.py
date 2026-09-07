@@ -218,7 +218,146 @@ ANNOTATIONS = [
         "Awake fires once per level load, so latching `this` here self-heals\n"
         "across reloads. Confirmed working in game.",
     ),
+    (
+        0x237CE0,
+        "PickRay__Update",
+        "void __fastcall f(void *__this);",
+        "PickRay::Update -- the player's interaction script (pickup raycast,\n"
+        "drop, shoot). 9444 instructions; only its entry is detoured.\n"
+        "\n"
+        "grannycheat uses this as its primary per-frame main-thread tick. It\n"
+        "beats AI_Granny::FixedUpdate on two counts: it runs whenever the\n"
+        "player exists (Granny can be switched off in the game's own options,\n"
+        "and then FixedUpdate never fires at all), and it's per-frame rather\n"
+        "than 50Hz.\n"
+        "\n"
+        "PlayerStatus sits at +0x88, which is a route to the camera that\n"
+        "doesn't pass through Granny -- see Camera__get_main's note.\n"
+        "\n"
+        "CheckItemDropping (0x233070) is the interesting neighbour: on a drop\n"
+        "it Instantiates the ItemDrop prefab, GetComponent<ItemSpawn>()s it,\n"
+        "and writes CountItem to pick which item. That means a dropped item is\n"
+        "a BRAND NEW object -- ItemRepositionSeed still references the\n"
+        "destroyed original, which is why dropped items need finding\n"
+        "separately.",
+    ),
+    (
+        0x247230,
+        "ItemSeedData__ctor",
+        "void __fastcall f(void *__this);",
+        "ItemSeedData::.ctor -- per-item component, and the key to enumerating\n"
+        "items properly:\n"
+        "\n"
+        "  +0x20 System.String* itemName\n"
+        "  +0x28 int            category\n"
+        "  +0x30 List<string>*  containedItems\n"
+        "\n"
+        "The category tooltip in the dump reads \"1=escape-only,\n"
+        "2=escape+puzzle, 3=puzzle-only, 3=free\" -- the last is evidently a\n"
+        "typo for 4, so treat anything outside 1..3 as free/misc.\n"
+        "\n"
+        "IMPORTANT: hooking this does NOT enumerate the level's items. Unity\n"
+        "deserializes scene-placed MonoBehaviours without running the managed\n"
+        "constructor, so this only fires for Instantiate()d objects -- in\n"
+        "practice, items the player drops. Building an item list from it and\n"
+        "treating it as complete is wrong.\n"
+        "\n"
+        "It IS the cheapest place to learn the Il2CppClass* (at offset 0 of\n"
+        "the instance), which FindObjectsOfType needs to build a System.Type.\n"
+        "\n"
+        "Also note category is per-INSTANCE: the ItemDrop prefab leaves it at\n"
+        "1 regardless of the item, so a dropped copy reports a different\n"
+        "category from the placed one.",
+    ),
+    (
+        0x2471A0,
+        "ItemSeedData__OnDestroy",
+        "void __fastcall f(void *__this);",
+        "ItemSeedData::OnDestroy -- calls WeightController::RemoveItem(this),\n"
+        "which is the proof that ItemSeedData sits on actual items rather than\n"
+        "on containers (containedItems makes it look otherwise).\n"
+        "\n"
+        "WeightController itself is a trigger-volume weight tracker for the\n"
+        "scale puzzle (OnTriggerEnter/Exit), NOT a global item registry, and\n"
+        "its Start (0x266B50) only builds a name->weight Dictionary. Those ~29\n"
+        "string literals are the real item name strings: Meat, WoodenStick,\n"
+        "Shotgun_Buttstock, GRVase, Vase2, ElectricBaton and so on -- useful\n"
+        "for working out the naming convention.",
+    ),
+    (
+        0x245BE0,
+        "ItemPresetSetup__Start",
+        "void __fastcall f(void *__this);",
+        "ItemPresetSetup::Start -- references ObjectsManager, which holds the\n"
+        "level's preset layouts (Preset1O..Preset5O, plus per-preset battery,\n"
+        "code and guillotine variants).\n"
+        "\n"
+        "This is why an 'alive' check is not enough for items: Granny keeps\n"
+        "several layouts in the level simultaneously and DEACTIVATES the ones\n"
+        "it isn't using. Their components stay perfectly alive, so anything\n"
+        "checking only m_CachedPtr reports items that were never spawned --\n"
+        "that put a winch marker inside a cabinet with no winch in it. Filter\n"
+        "on GameObject::get_activeInHierarchy, or pass includeInactive=false\n"
+        "to FindObjectsOfType.",
+    ),
     # ---- UnityEngine: trailing MethodInfo*, NULL is accepted -------------
+    (
+        0x725FF0,
+        "Object__FindObjectsOfType",
+        "void *__fastcall f(void *system_type, bool include_inactive, void *method);",
+        "UnityEngine.Object::FindObjectsOfType(Type, bool) -- the non-generic\n"
+        "overload, and the only COMPLETE way to enumerate a component type\n"
+        "here. No baked generic MethodInfo exists for ItemSeedData, so the\n"
+        "generic form is unusable; this one takes a System.Type built at\n"
+        "runtime instead.\n"
+        "\n"
+        "Building that Type without any offsets, via IL2CPP's exported C API:\n"
+        "\n"
+        "  klass  = *(void **)some_live_instance;      // Il2CppClass* at +0\n"
+        "  type   = il2cpp_class_get_type(klass);      // GetProcAddress\n"
+        "  sysobj = il2cpp_type_get_object(type);      // GetProcAddress\n"
+        "  array  = FindObjectsOfType(sysobj, false, NULL);\n"
+        "\n"
+        "include_inactive=false conveniently excludes the deactivated preset\n"
+        "placeholders described on ItemPresetSetup__Start.\n"
+        "\n"
+        "Returns an Il2CppArray: length is a 64-bit value at +0x18, elements\n"
+        "start at +0x20. It scans every object in the scene, so call it on a\n"
+        "timer and re-read positions from the cached components per frame.",
+    ),
+    (
+        0x2B7FD0,
+        "GameObject__GetComponent_shared",
+        "void __fastcall f(void *object, void *out_component, void *method);",
+        "GameObject::GetComponent<T>, fully-shared-generic form.\n"
+        "\n"
+        "ARGUMENT ORDER IS NOT WHAT IDA SHOWS. It labels the first two params\n"
+        "'retstr' and 'this', which reads as (return buffer, object). The call\n"
+        "site in ItemSpawn::Update proves otherwise:\n"
+        "\n"
+        "  mov r8,  cs:Method$...GetComponent_Rigidbody_   ; MethodInfo\n"
+        "  lea rdx, [rsp+arg_0]                            ; OUT buffer\n"
+        "  mov rcx, rdi                                    ; the GameObject\n"
+        "  call GameObject$$GetComponent___Il2CppFullySharedGenericType_\n"
+        "  mov rcx, [rsp+arg_0]                            ; result read back\n"
+        "\n"
+        "So: rcx = object, rdx = out buffer, r8 = MethodInfo, and the\n"
+        "component pointer lands at *out. Getting this backwards passes a\n"
+        "stack address as the object.\n"
+        "\n"
+        "The baked MethodInfo globals hold a POINTER to the MethodInfo, so\n"
+        "dereference before passing:\n"
+        "  Method$UnityEngine.GameObject.GetComponent_ItemSeedData_() at\n"
+        "  0xC338B8.",
+    ),
+    (
+        0x71D4A0,
+        "Component__get_gameObject",
+        "void *__fastcall f(void *__this, void *method);",
+        "Component::get_gameObject. Needed to ask whether a component's object\n"
+        "is actually active -- a live component says nothing about that, see\n"
+        "ItemPresetSetup__Start.",
+    ),
     (
         0x71D550,
         "Component__get_transform",
@@ -293,6 +432,28 @@ AI_Granny fields used by grannycheat (offsets into the instance):
 
 PlayerStatus:
   +0x110 void*  PlayerCam (Camera)  <- the reliable camera source
+
+PickRay:
+  +0x88  void*  PlayerStatus        <- camera route that avoids Granny
+
+ItemSeedData (per item, the complete enumeration source):
+  +0x20  str*   itemName
+  +0x28  int    category   1=escape, 2=escape+puzzle, 3=puzzle, else free
+  +0x30  List*  containedItems
+
+ItemSpawn (one-shot dropper, NOT a registry):
+  +0x24  float  CountItem   1-based, selects which of the 55 fields to drop
+  +0x28..+0x1D8  GameObject* x55
+
+UnityEngine.Object:
+  +0x10  IntPtr m_CachedPtr  zeroed by Destroy(); the managed wrapper lives on
+
+Any IL2CPP object:
+  +0x00  Il2CppClass*        compare it -- liveness alone can't spot a block
+                             the GC has reused
+
+System.String:  length int32 at +0x10, UTF-16 chars from +0x14
+Il2CppArray:    length int64 at +0x18, elements from +0x20
 """
 
 
