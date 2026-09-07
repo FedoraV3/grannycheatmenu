@@ -173,6 +173,89 @@ static const uintptr_t FIELD_PickRay_PlayerStatus             = 0x88;
 #define ITEMSEED_ITEM_COUNT       35
 
 /*
+ * ItemSeedData -- a per-item MonoBehaviour carrying the item's own name and
+ * the developers' category. This is the complete item source: every item in
+ * the level has one, whereas ItemRepositionSeed only covers the 35 it
+ * repositions and ItemSpawn's fields belong to the dropper.
+ *
+ * Hooking .ctor and OnDestroy gives a self-maintaining registry -- items add
+ * themselves when built and remove themselves when picked up.
+ *
+ * Read the fields at collect time, NOT inside .ctor: Unity assigns
+ * serialized fields after the constructor runs, so itemName is still null
+ * there.
+ */
+static const uintptr_t OFFSET_ItemSeedData_ctor               = 0x247230;
+static const uintptr_t OFFSET_ItemSeedData_OnDestroy          = 0x2471A0;
+typedef granny_method_t ItemSeedData_ctor_t;
+typedef granny_method_t ItemSeedData_OnDestroy_t;
+
+/**
+ * GameObject::GetComponent<T>, the fully-shared-generic form.
+ *
+ * Convention confirmed from ItemSpawn::Update's call site rather than
+ * inferred: rcx = the GameObject, rdx = an out buffer that receives the
+ * component pointer, r8 = the baked MethodInfo for the instantiation. IDA
+ * labels the first two "retstr" and "this", which is misleading.
+ *
+ *   void *component = NULL;
+ *   get_component(game_object, &component, *(void **)(base + METHODINFO_...));
+ *
+ * Needed because scene-placed items never enter the ItemSeedData registry --
+ * Unity deserializes their MonoBehaviours without running the managed
+ * .ctor we hook -- so their category has to be fetched directly.
+ */
+static const uintptr_t OFFSET_GameObject_GetComponent_shared  = 0x2B7FD0;
+
+/**
+ * The baked MethodInfo* for GetComponent<ItemSeedData>. This global holds a
+ * POINTER to the MethodInfo, so dereference it before passing it on.
+ */
+static const uintptr_t METHODINFO_GetComponent_ItemSeedData   = 0xC338B8;
+typedef void(__fastcall *GameObject_GetComponent_t)(void *object, void *out_component, void *method);
+
+/**
+ * UnityEngine.Object::FindObjectsOfType(Type, bool includeInactive).
+ *
+ * The non-generic overload, so it can be called with a System.Type built at
+ * runtime instead of needing a baked generic MethodInfo. This is the only
+ * COMPLETE item source: ItemRepositionSeed knows just the 35 it repositions
+ * and the ItemSeedData registry only catches Instantiate()d objects, since
+ * Unity deserializes scene-placed MonoBehaviours without running the managed
+ * .ctor we hook.
+ *
+ * includeInactive = false also drops the deactivated preset placeholders for
+ * free, which previously needed a separate activeInHierarchy call.
+ *
+ * Expensive (it scans every object), so call it on a timer and re-read
+ * positions from the cached components each frame.
+ */
+static const uintptr_t OFFSET_Object_FindObjectsOfType        = 0x725FF0;
+typedef void *(__fastcall *Object_FindObjectsOfType_t)(void *system_type, bool include_inactive, void *method);
+
+/*
+ * Il2CppArray layout: klass at 0, monitor at 8, bounds at 0x10, max_length
+ * at 0x18, and the elements from 0x20.
+ */
+#define IL2CPP_ARRAY_LENGTH_OFFSET 0x18
+#define IL2CPP_ARRAY_ELEMENTS_OFFSET 0x20
+
+static const uintptr_t FIELD_ItemSeedData_itemName            = 0x20; /**< System.String* */
+/**
+ * ItemSeedData::category, straight from the dev tooltip:
+ * "1=escape-only, 2=escape+puzzle, 3=puzzle-only, 3=free" -- the last is
+ * evidently a typo for 4, so treat anything outside 1..3 as free/misc.
+ */
+static const uintptr_t FIELD_ItemSeedData_category            = 0x28; /**< int */
+
+/*
+ * System.String layout under IL2CPP: klass at 0, monitor at 8, length as an
+ * int32 at 0x10, then UTF-16 characters from 0x14.
+ */
+#define IL2CPP_STRING_LENGTH_OFFSET 0x10
+#define IL2CPP_STRING_CHARS_OFFSET  0x14
+
+/*
  * AI_Granny *instance field* offsets (from Il2CppDumper's dump.cs). These
  * are offsets into the object -- add them to an instance pointer from
  * ai_granny_current(), NOT to the module base like the RVAs above.
@@ -233,6 +316,17 @@ static const uintptr_t FIELD_PlayerStatus_PlayerCam       = 0x110; /**< Camera* 
  * parameter. Unity's Matrix4x4 is stored column-major: element (row, col)
  * is raw[col * 4 + row].
  */
+
+/**
+ * Component::get_gameObject -- `GameObject *f(Component *this, MethodInfo *)`.
+ *
+ * Needed to ask whether a component's object is actually active. The level
+ * is full of item objects that exist but are deactivated for this run's
+ * layout (see ObjectsManager's Preset1O..Preset5O), and their components
+ * stay perfectly alive -- so a liveness check alone happily reports items
+ * that aren't in the world.
+ */
+static const uintptr_t OFFSET_Component_get_gameObject        = 0x71D4A0;
 
 /** Component::get_transform -- `Transform *f(Component *this, MethodInfo *)`. */
 static const uintptr_t OFFSET_Component_get_transform         = 0x71D550;

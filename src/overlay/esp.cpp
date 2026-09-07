@@ -13,6 +13,13 @@ bool esp_items_enabled = false;
 bool esp_fullbright_enabled = false;
 bool esp_items_ignore_active = false;
 bool esp_items_verbose = false;
+
+/* Per-category filters, using the game's own classification from
+ * ItemSeedData::category. */
+bool esp_show_escape_items = true;
+bool esp_show_escape_puzzle_items = true;
+bool esp_show_puzzle_items = true;
+bool esp_show_other_items = true;
 int esp_item_scan_limit = ITEMSEED_ITEM_COUNT;
 
 /* Tuned by eye in game -- Granny's model is a good deal taller in world
@@ -75,13 +82,33 @@ static void *volatile g_dropped[ITEMSPAWN_ITEM_COUNT];
  * GameObject. Cheaper than resolving the TypeInfo global, and exact. */
 static void *volatile g_gameobject_klass = NULL;
 
+/* Same idea for ItemSeedData, captured in its .ctor hook where the object
+ * is unambiguously one. Without this, a stale registry entry whose block
+ * the GC has reused passes the liveness check and gets called into. */
+static void *volatile g_item_seed_data_klass = NULL;
+
+
+/* Live ItemSeedData components, maintained by the .ctor/OnDestroy hooks.
+ * This is the complete item set; the ItemRepositionSeed and dropped-item
+ * walks below are only a fallback for when it comes up empty. */
+#define ESP_MAX_SEED_ITEMS 192
+static void *g_seed_items[ESP_MAX_SEED_ITEMS];
+static int g_seed_item_count = 0;
+
+/* Long enough for the game's longest item name plus the spaces the
+ * prettifier inserts ("Shotgun_Buttstock" -> "Shotgun Buttstock"). */
+#define ESP_ITEM_NAME_MAX 40
 
 typedef struct {
 	esp_vec3 position;
-	const char *name;
+	const char *name;   /**< static table entry, when from the fallback path */
+	char owned_name[ESP_ITEM_NAME_MAX]; /**< from ItemSeedData::itemName otherwise */
+	int category;        /**< 1 escape, 2 escape+puzzle, 3 puzzle, else free */
 } esp_item;
 
-#define ESP_MAX_ITEMS (ITEMSEED_ITEM_COUNT + ITEMSPAWN_ITEM_COUNT)
+/* Sized for the ItemSeedData registry, which is larger than the fallback
+ * lists combined. */
+#define ESP_MAX_ITEMS ESP_MAX_SEED_ITEMS
 
 static esp_item g_items[ESP_MAX_ITEMS];
 static int g_item_count = 0;
@@ -100,6 +127,35 @@ static void *volatile g_item_spawn = NULL;
 /* The player's PickRay, latched from its Update. Drives the ESP whenever
  * Granny is switched off and AI_Granny::FixedUpdate never fires. */
 static void *volatile g_pickray = NULL;
+
+/* Guards the state handed from the game thread (which collects) to the
+ * render thread (which draws): g_items/g_item_count, the view-projection
+ * matrix, and Granny's position. Without it a reader can see an entry
+ * half-written -- a torn 12-byte position or 64-byte matrix draws markers
+ * at wrong positions for a frame.
+ *
+ * Held only across the publish/read, never across the IL2CPP walk, so the
+ * render thread is never blocked for long.
+ *
+ * Lock order where both are held: the ImGui lock is taken first (in
+ * render_frame), then this one inside esp_render. The game thread only ever
+ * takes one or the other, so the orders can't invert. */
+static CRITICAL_SECTION g_esp_lock;
+static bool g_esp_lock_ready = false;
+
+static void esp_lock(void) {
+	if (g_esp_lock_ready) EnterCriticalSection(&g_esp_lock);
+}
+
+static void esp_unlock(void) {
+	if (g_esp_lock_ready) LeaveCriticalSection(&g_esp_lock);
+}
+
+void esp_init(void) {
+	if (g_esp_lock_ready) return;
+	InitializeCriticalSection(&g_esp_lock);
+	g_esp_lock_ready = true;
+}
 
 /* A UnityEngine.Object whose native side has been destroyed keeps its
  * managed wrapper, so the pointer still looks valid from C -- only
@@ -125,8 +181,19 @@ static bool gameobject_still_valid(void *object) {
 	return *(void **)object == g_gameobject_klass;
 }
 
+/* The registry's equivalent. Entries can outlive their object when OnDestroy
+ * doesn't reach us (scene teardown ordering), and liveness alone can't tell
+ * a reused block apart -- the new occupant has its own non-zero
+ * m_CachedPtr. */
+static bool item_seed_data_still_valid(void *component) {
+	if (!unity_object_alive(component)) return false;
+	if (!g_item_seed_data_klass) return true; /* nothing to compare against yet */
+	return *(void **)component == g_item_seed_data_klass;
+}
+
 void esp_get_debug_info(esp_debug_info *out) {
 	if (!out) return;
+	esp_lock();
 	out->have_view_projection = g_have_view_projection;
 	out->have_granny_position = g_have_granny_position;
 	out->item_count = g_item_count;
@@ -141,15 +208,18 @@ void esp_get_debug_info(esp_debug_info *out) {
 	out->granny_ticks = g_granny_ticks;
 	out->item_ticks = g_item_ticks;
 	out->pickray_ticks = g_pickray_ticks;
+	esp_unlock();
 }
 
 void esp_set_view_projection(const esp_mat4 *vp) {
+	esp_lock();
 	if (vp) {
 		g_view_projection = *vp;
 		g_have_view_projection = true;
 	} else {
 		g_have_view_projection = false;
 	}
+	esp_unlock();
 }
 
 bool esp_world_to_screen(esp_vec3 world, float *out_x, float *out_y) {
@@ -184,6 +254,27 @@ bool esp_world_to_screen(esp_vec3 world, float *out_x, float *out_y) {
 	*out_x = x;
 	*out_y = y;
 	return true;
+}
+
+/* ItemSeedData::category, per the dev tooltip. Anything outside 1..3 is
+ * treated as free/misc -- the tooltip labels 3 twice, so the intended
+ * fourth value is a guess and shouldn't be relied on. */
+static bool esp_category_shown(int category) {
+	switch (category) {
+	case 1: return esp_show_escape_items;
+	case 2: return esp_show_escape_puzzle_items;
+	case 3: return esp_show_puzzle_items;
+	default: return esp_show_other_items;
+	}
+}
+
+static ImU32 esp_category_color(int category) {
+	switch (category) {
+	case 1: return IM_COL32(120, 255, 140, 255); /* escape-only  -- green */
+	case 2: return IM_COL32(255, 220, 110, 255); /* escape+puzzle -- amber */
+	case 3: return IM_COL32(150, 190, 255, 255); /* puzzle-only  -- blue  */
+	default: return IM_COL32(190, 190, 190, 255); /* free / misc  -- grey  */
+	}
 }
 
 /* Box + label at a projected world position. Height is in world units and
@@ -322,21 +413,29 @@ void esp_collect(void *granny_instance) {
 	if (base == 0) return;
 
 	if (!refresh_camera(base)) {
+		esp_lock();
 		g_have_granny_position = false;
+		esp_unlock();
 		return;
 	}
 
-	g_have_granny_position = false;
+	esp_vec3 position;
+	bool have_position = false;
 	if (unity_object_alive(granny_instance)) {
 		void *transform =
 		    ((Component_get_transform_t)(base + OFFSET_Component_get_transform))(granny_instance, NULL);
 		if (unity_object_alive(transform)) {
-			esp_vec3 position;
 			((Transform_get_position_t)(base + OFFSET_Transform_get_position))(&position, transform, NULL);
-			g_granny_position = position;
-			g_have_granny_position = true;
+			have_position = true;
 		}
 	}
+
+	/* Published together so the render thread never sees the flag set
+	 * against a half-written position. */
+	esp_lock();
+	if (have_position) g_granny_position = position;
+	g_have_granny_position = have_position;
+	esp_unlock();
 
 	/* Items are collected on the PickRay tick instead -- that one keeps
 	 * running when Granny is switched off, and this hook doesn't. */
@@ -345,12 +444,286 @@ void esp_collect(void *granny_instance) {
 /* Walks ItemSpawn's item pointers. Driven from esp_collect() on the
  * FixedUpdate tick, not from the ItemSpawn hook -- that one only fires on
  * pickup/drop, so positions would almost never refresh. */
+static bool is_upper(char c) { return c >= 'A' && c <= 'Z'; }
+static bool is_lower(char c) { return c >= 'a' && c <= 'z'; }
+static bool is_digit(char c) { return c >= '0' && c <= '9'; }
+
+/* Copies an IL2CPP System.String into `out`, splitting the game's PascalCase
+ * item names into readable words.
+ *
+ * The names are written for code, not display: "WoodenStick", "CarBattery",
+ * "Shotgun_Buttstock", "GRVase", "Vase2". Rather than a lookup table -- which
+ * would only cover the names we happen to have seen -- the split is derived:
+ *
+ *   underscore                      -> space      Shotgun_Trigger / Shotgun Trigger
+ *   upper after lower               -> space      WoodenStick     / Wooden Stick
+ *   upper starting a word after an
+ *     acronym run                   -> space      GRVase          / GR Vase
+ *   digit after a letter            -> space      Vase2           / Vase 2
+ *
+ * Item names are plain ASCII, so anything outside that range becomes '?'. */
+static void il2cpp_string_to_ascii(void *string_object, char *out, int out_size) {
+	out[0] = '\0';
+	if (!string_object || out_size <= 0) return;
+
+	int length = *(int *)((uintptr_t)string_object + IL2CPP_STRING_LENGTH_OFFSET);
+	if (length <= 0) return;
+
+	const wchar_t *chars = (const wchar_t *)((uintptr_t)string_object + IL2CPP_STRING_CHARS_OFFSET);
+	int written = 0;
+
+	for (int i = 0; i < length && written < out_size - 1; i++) {
+		wchar_t wide = chars[i];
+		char c = (wide >= 0x20 && wide < 0x7F) ? (char)wide : '?';
+
+		if (c == '_') {
+			if (written > 0 && out[written - 1] != ' ') out[written++] = ' ';
+			continue;
+		}
+
+		if (written > 0 && out[written - 1] != ' ') {
+			char previous = (char)chars[i - 1];
+			char next = (i + 1 < length) ? (char)chars[i + 1] : '\0';
+			bool split = false;
+
+			if (is_upper(c)) {
+				/* End of a word, or the start of one after an acronym. */
+				split = is_lower(previous) || is_digit(previous) ||
+				        (is_upper(previous) && is_lower(next));
+			} else if (is_digit(c) && !is_digit(previous)) {
+				split = true;
+			}
+
+			if (split && written < out_size - 1) out[written++] = ' ';
+		}
+
+		if (written < out_size - 1) out[written++] = c;
+	}
+	out[written] = '\0';
+}
+
+/* Remembered category per item name.
+ *
+ * category lives on the instance, and the copy produced by dropping an item
+ * is a fresh Instantiate() of the ItemDrop prefab, whose ItemSeedData is
+ * left at category 1 rather than the item's real one. So the same item goes
+ * green the moment you drop it. Keying on the name instead, first sighting
+ * wins: the level's properly-configured placed copy is seen first, so an
+ * item keeps one colour for its whole life.
+ *
+ * Cleared on level change along with everything else, since categories can
+ * legitimately differ between levels. */
+#define ESP_CATEGORY_CACHE_SIZE 96
+typedef struct {
+	char name[ESP_ITEM_NAME_MAX];
+	int category;
+} esp_category_entry;
+
+static esp_category_entry g_category_cache[ESP_CATEGORY_CACHE_SIZE];
+static int g_category_cache_count = 0;
+
+static bool esp_names_equal(const char *a, const char *b) {
+	while (*a && *a == *b) {
+		a++;
+		b++;
+	}
+	return *a == *b;
+}
+
+/* Returns the category this item is already known by, recording `observed`
+ * the first time the name is seen. */
+static int remembered_category(const char *name, int observed) {
+	if (!name || !name[0]) return observed;
+
+	for (int i = 0; i < g_category_cache_count; i++) {
+		if (esp_names_equal(g_category_cache[i].name, name)) {
+			return g_category_cache[i].category;
+		}
+	}
+
+	if (g_category_cache_count < ESP_CATEGORY_CACHE_SIZE) {
+		esp_category_entry *entry = &g_category_cache[g_category_cache_count++];
+		int i = 0;
+		for (; name[i] && i < (int)sizeof(entry->name) - 1; i++) {
+			entry->name[i] = name[i];
+		}
+		entry->name[i] = '\0';
+		entry->category = observed;
+	}
+	return observed;
+}
+
+/* The System.Type for ItemSeedData, built once from the class pointer we
+ * capture off a live instance. Needed because FindObjectsOfType's
+ * non-generic overload takes a Type rather than a baked generic MethodInfo,
+ * and no baked one exists for this class. */
+static void *g_item_seed_data_type = NULL;
+
+/* Components found by the last scene scan, plus its cadence counter. */
+static void *g_found_items[ESP_MAX_SEED_ITEMS];
+static int g_found_count = 0;
+static int g_scan_countdown = 0;
+
+/* FindObjectsOfType walks every object in the scene, so it runs on a timer
+ * rather than per frame. Positions are re-read from these cached components
+ * every frame, which is what actually needs to be current. */
+#define ESP_SCAN_INTERVAL_TICKS 30
+
+static void *build_item_seed_data_type(void) {
+	if (g_item_seed_data_type) return g_item_seed_data_type;
+	if (!g_item_seed_data_klass) return NULL;
+
+	HMODULE game_assembly = GetModuleHandleW(L"GameAssembly.dll");
+	if (!game_assembly) return NULL;
+
+	/* IL2CPP exports its C API by name, so these resolve without needing
+	 * offsets that would drift between game builds. */
+	typedef void *(*il2cpp_class_get_type_t)(void *klass);
+	typedef void *(*il2cpp_type_get_object_t)(void *type);
+
+	il2cpp_class_get_type_t class_get_type =
+	    (il2cpp_class_get_type_t)GetProcAddress(game_assembly, "il2cpp_class_get_type");
+	il2cpp_type_get_object_t type_get_object =
+	    (il2cpp_type_get_object_t)GetProcAddress(game_assembly, "il2cpp_type_get_object");
+	if (!class_get_type || !type_get_object) {
+		OutputDebugStringA("[esp] il2cpp type exports missing, falling back to partial sources");
+		return NULL;
+	}
+
+	void *type = class_get_type(g_item_seed_data_klass);
+	if (!type) return NULL;
+
+	g_item_seed_data_type = type_get_object(type);
+	return g_item_seed_data_type;
+}
+
+/* Rescans the scene for every ItemSeedData. Returns true if the scan ran. */
+static bool rescan_items(uintptr_t base) {
+	void *system_type = build_item_seed_data_type();
+	if (!system_type) return false;
+
+	/* includeInactive = false, so deactivated preset placeholders never
+	 * enter the list in the first place. */
+	void *array = ((Object_FindObjectsOfType_t)(base + OFFSET_Object_FindObjectsOfType))(
+	    system_type, false, NULL);
+	if (!array) return false;
+
+	long long length = *(long long *)((uintptr_t)array + IL2CPP_ARRAY_LENGTH_OFFSET);
+	if (length < 0) return false;
+	if (length > ESP_MAX_SEED_ITEMS) length = ESP_MAX_SEED_ITEMS;
+
+	void **elements = (void **)((uintptr_t)array + IL2CPP_ARRAY_ELEMENTS_OFFSET);
+
+	esp_lock();
+	g_found_count = 0;
+	for (long long i = 0; i < length; i++) {
+		if (item_seed_data_still_valid(elements[i])) {
+			g_found_items[g_found_count++] = elements[i];
+		}
+	}
+	esp_unlock();
+	return true;
+}
+
+/* Drops registry entries whose object is gone, without doing any of the
+ * per-item work. Runs on the game thread like everything else that touches
+ * the registry, so it takes the lock for the same reason the hooks do. */
+static void esp_prune_registry(void) {
+	esp_lock();
+	int write = 0;
+	for (int i = 0; i < g_seed_item_count; i++) {
+		if (item_seed_data_still_valid(g_seed_items[i])) {
+			g_seed_items[write++] = g_seed_items[i];
+		}
+	}
+	g_seed_item_count = write;
+	esp_unlock();
+}
+
+/* Walks the live ItemSeedData components. Returns how many were staged, and
+ * fills `seen_objects` with each item's GameObject so the dropped-item walk
+ * can skip anything already reported here. */
+static int collect_seed_data_items(uintptr_t base, void **components, int component_count,
+                                    esp_item *staged, int max_items,
+                                    void **seen_objects, int *seen_count) {
+	Component_get_transform_t get_transform =
+	    (Component_get_transform_t)(base + OFFSET_Component_get_transform);
+	Component_get_transform_t get_gameobject =
+	    (Component_get_transform_t)(base + OFFSET_Component_get_gameObject);
+	GameObject_get_active_t get_active =
+	    (GameObject_get_active_t)(base + OFFSET_GameObject_get_activeInHierarchy);
+	Transform_get_position_t get_position =
+	    (Transform_get_position_t)(base + OFFSET_Transform_get_position);
+
+	int count = 0;
+	int write = 0;
+
+	/* Compaction rewrites the registry, so hold the lock for the same
+	 * reason the .ctor/OnDestroy hooks do. Everything here is game-thread
+	 * only today, but the locking shouldn't be inconsistent between the
+	 * writers. */
+	esp_lock();
+	for (int i = 0; i < component_count; i++) {
+		void *component = components[i];
+
+		/* OnDestroy should have removed it, but an item destroyed without
+		 * that firing leaves a dangling entry. The class check matters as
+		 * much as liveness here: once the GC reuses the block, the new
+		 * occupant's own m_CachedPtr makes it look alive, and we'd then call
+		 * Component methods on something that isn't a Component. */
+		if (!item_seed_data_still_valid(component)) continue;
+		/* Compacting in place is only meaningful when the caller passed the
+		 * registry; the scan list is rebuilt wholesale each rescan. */
+		if (components == g_seed_items) g_seed_items[write++] = component;
+
+		if (count >= max_items) continue;
+
+		/* The component being alive is NOT enough. Granny keeps several
+		 * preset layouts in the level at once and deactivates the ones it
+		 * isn't using, so an unused placeholder still has a live
+		 * ItemSeedData -- that's what put a winch marker inside a cabinet
+		 * with no winch in it. Only draw objects that are actually active. */
+		void *game_object = get_gameobject(component, NULL);
+		if (!unity_object_alive(game_object)) continue;
+		if (!get_active(game_object, NULL)) continue;
+
+		void *transform = get_transform(component, NULL);
+		if (!unity_object_alive(transform)) continue;
+
+		esp_vec3 position;
+		get_position(&position, transform, NULL);
+
+		if (*seen_count < max_items) seen_objects[(*seen_count)++] = game_object;
+
+		staged[count].position = position;
+		staged[count].name = NULL;
+		/* Name first: the category is resolved through it, so that a dropped
+		 * copy doesn't report a different category from the placed one. */
+		il2cpp_string_to_ascii(*(void **)((uintptr_t)component + FIELD_ItemSeedData_itemName),
+		                       staged[count].owned_name, (int)sizeof(staged[count].owned_name));
+		staged[count].category = remembered_category(
+		    staged[count].owned_name,
+		    *(int *)((uintptr_t)component + FIELD_ItemSeedData_category));
+		count++;
+	}
+	if (components == g_seed_items) g_seed_item_count = write;
+	esp_unlock();
+
+	return count;
+}
+
+/* Staging buffers for the collect below. File-scope rather than stack
+ * locals: together they are roughly 12KB, and this runs every frame inside
+ * a detour on PickRay::Update, on top of a call stack we don't control.
+ * Safe to share because collection only ever happens on the game thread. */
+static esp_item g_staged[ESP_MAX_ITEMS];
+static void *g_seen_objects[ESP_MAX_ITEMS];
+
 void esp_collect_items(void *item_seed) {
-	g_item_count = 0;
-	g_items_alive = 0;
-	g_items_active = 0;
-	/* Latched at Awake, possibly a level ago -- always re-verify. */
-	if (!unity_object_alive(item_seed)) return;
+	/* Built here and published in one step at the end, so the render thread
+	 * never observes the shared array mid-rewrite. */
+	esp_item *staged = g_staged;
+	int staged_count = 0;
 
 	uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
 	if (base == 0) return;
@@ -358,32 +731,132 @@ void esp_collect_items(void *item_seed) {
 	Transform_get_position_t get_position =
 	    (Transform_get_position_t)(base + OFFSET_Transform_get_position);
 
-	int limit = esp_item_scan_limit;
-	if (limit < 0) limit = 0;
-	if (limit > ITEMSEED_ITEM_COUNT) limit = ITEMSEED_ITEM_COUNT;
+	/* All three sources are complementary, not alternatives -- each one is
+	 * partial, so they're merged and deduplicated by GameObject rather than
+	 * chosen between.
+	 *
+	 * The registry only ever holds items whose managed constructor actually
+	 * ran, which means Instantiate()d ones: Unity deserializes scene-placed
+	 * MonoBehaviours without calling the C# .ctor we hook. Gating the
+	 * ItemRepositionSeed walk on the registry being empty therefore broke
+	 * the moment anything was dropped -- one Instantiate made staged_count
+	 * non-zero and every placed item vanished with the skipped fallback. */
+	void **seen_objects = g_seen_objects;
+	int seen_count = 0;
 
-	for (int i = 0; i < limit; i++) {
-		/* These are Transforms, so no GetComponent hop is needed. */
-		void *transform = *(void **)((uintptr_t)item_seed + ITEMSEED_FIRST_ITEM_FIELD + i * 8);
+	/* Rescan the scene periodically. FindObjectsOfType(includeInactive=false)
+	 * returns every active ItemSeedData, which is genuinely complete -- so
+	 * when it works, the partial sources below are redundant rather than
+	 * complementary and are skipped entirely. */
+	if (--g_scan_countdown <= 0) {
+		g_scan_countdown = ESP_SCAN_INTERVAL_TICKS;
+		rescan_items(base);
+	}
 
-		if (esp_items_verbose) {
-			char line[160];
-			wsprintfA(line, "[esp] slot %d %s tf=%p", i, g_item_names[i], transform);
-			OutputDebugStringA(line);
+	if (g_found_count > 0) {
+		staged_count = collect_seed_data_items(base, g_found_items, g_found_count, staged,
+		                                        ESP_MAX_ITEMS, seen_objects, &seen_count);
+		esp_lock();
+		for (int i = 0; i < staged_count; i++) {
+			g_items[i] = staged[i];
 		}
+		g_item_count = staged_count;
+		g_items_alive = staged_count;
+		g_items_active = staged_count;
+		esp_unlock();
+		return;
+	}
 
-		/* A collected item's Transform is destroyed but its managed wrapper
-		 * survives, so a plain NULL check would let a dead object through. */
-		if (!unity_object_alive(transform)) continue;
-		g_items_alive++;
-		g_items_active++;
+	/* No scene scan available (il2cpp exports missing, or the class pointer
+	 * hasn't been learned yet). Fall back to the partial sources, merged and
+	 * deduplicated. */
+	staged_count = collect_seed_data_items(base, g_seed_items, g_seed_item_count, staged,
+	                                        ESP_MAX_ITEMS, seen_objects, &seen_count);
 
-		esp_vec3 position;
-		get_position(&position, transform, NULL);
+	if (unity_object_alive(item_seed)) {
+		int limit = esp_item_scan_limit;
+		if (limit < 0) limit = 0;
+		if (limit > ITEMSEED_ITEM_COUNT) limit = ITEMSEED_ITEM_COUNT;
 
-		g_items[g_item_count].position = position;
-		g_items[g_item_count].name = g_item_names[i];
-		g_item_count++;
+		for (int i = 0; i < limit; i++) {
+			/* These are Transforms, so no GetComponent hop is needed. */
+			void *transform = *(void **)((uintptr_t)item_seed + ITEMSEED_FIRST_ITEM_FIELD + i * 8);
+
+			if (esp_items_verbose) {
+				char line[160];
+				/* wsprintfA has no %p -- its conversions stop at %x/%X. */
+				wsprintfA(line, "[esp] slot %d %s tf=%llx", i, g_item_names[i],
+				          (unsigned long long)(uintptr_t)transform);
+				OutputDebugStringA(line);
+			}
+
+			/* A collected item's Transform is destroyed but its managed
+			 * wrapper survives, so a plain NULL check would let a dead
+			 * object through. */
+			if (!unity_object_alive(transform)) continue;
+			if (staged_count >= ESP_MAX_ITEMS) break;
+
+			/* Transform is a Component, so this reaches the same GameObject
+			 * the registry would have recorded -- which is what lets the two
+			 * sources be merged without drawing an item twice. */
+			void *game_object =
+			    ((Component_get_transform_t)(base + OFFSET_Component_get_gameObject))(transform, NULL);
+			if (!unity_object_alive(game_object)) continue;
+			/* Deactivated preset placeholders are present but not in play. */
+			if (!((GameObject_get_active_t)(base + OFFSET_GameObject_get_activeInHierarchy))(game_object, NULL)) {
+				continue;
+			}
+
+			bool already_seen = false;
+			for (int s = 0; s < seen_count; s++) {
+				if (seen_objects[s] == game_object) {
+					already_seen = true;
+					break;
+				}
+			}
+			if (already_seen) continue;
+			if (seen_count < ESP_MAX_ITEMS) seen_objects[seen_count++] = game_object;
+
+			esp_vec3 position;
+			get_position(&position, transform, NULL);
+
+			staged[staged_count].position = position;
+			staged[staged_count].name = g_item_names[i];
+			staged[staged_count].owned_name[0] = 0;
+			staged[staged_count].category = 0;
+
+			/* Pull the real category off the object's own ItemSeedData.
+			 * Without this these items all report category 0 and render as
+			 * "other/free" grey, while dropped ones (which do reach the
+			 * registry) show their true category -- the same item changing
+			 * colour depending on how we found it. */
+			void *method_info = *(void **)(base + METHODINFO_GetComponent_ItemSeedData);
+			if (method_info) {
+				void *seed_component = NULL;
+				((GameObject_GetComponent_t)(base + OFFSET_GameObject_GetComponent_shared))(
+				    game_object, &seed_component, method_info);
+				if (unity_object_alive(seed_component)) {
+					/* Also the earliest chance to learn the class, which the
+					 * scene scan needs to build its System.Type -- the .ctor
+					 * hook alone wouldn't fire until something is dropped. */
+					if (!g_item_seed_data_klass) {
+						g_item_seed_data_klass = *(void **)seed_component;
+					}
+					staged[staged_count].category =
+					    *(int *)((uintptr_t)seed_component + FIELD_ItemSeedData_category);
+					/* Prefer the game's own name over our static table. */
+					il2cpp_string_to_ascii(
+					    *(void **)((uintptr_t)seed_component + FIELD_ItemSeedData_itemName),
+					    staged[staged_count].owned_name,
+					    (int)sizeof(staged[staged_count].owned_name));
+					if (staged[staged_count].owned_name[0]) {
+						staged[staged_count].name = NULL;
+					}
+				}
+			}
+
+			staged_count++;
+		}
 	}
 
 	/* Dropped items are separate objects that ItemRepositionSeed never
@@ -394,7 +867,7 @@ void esp_collect_items(void *item_seed) {
 	GameObject_get_active_t get_active =
 	    (GameObject_get_active_t)(base + OFFSET_GameObject_get_activeInHierarchy);
 
-	for (int i = 0; i < ITEMSPAWN_ITEM_COUNT && g_item_count < ESP_MAX_ITEMS; i++) {
+	for (int i = 0; i < ITEMSPAWN_ITEM_COUNT && staged_count < ESP_MAX_ITEMS; i++) {
 		void *object = g_dropped[i];
 		/* Picked up again -- destroyed, or at least deactivated. The class
 		 * check also rejects a slot whose object the GC has since reclaimed
@@ -405,18 +878,38 @@ void esp_collect_items(void *item_seed) {
 		}
 		if (!get_active(object, NULL)) continue;
 
+		/* Skip anything the ItemSeedData registry already reported, so a
+		 * dropped item that does re-register isn't drawn twice. */
+		bool already_seen = false;
+		for (int s = 0; s < seen_count; s++) {
+			if (seen_objects[s] == object) {
+				already_seen = true;
+				break;
+			}
+		}
+		if (already_seen) continue;
+
 		void *transform = get_transform(object, NULL);
 		if (!unity_object_alive(transform)) continue;
 
 		esp_vec3 position;
 		get_position(&position, transform, NULL);
 
-		g_items_alive++;
-		g_items_active++;
-		g_items[g_item_count].position = position;
-		g_items[g_item_count].name = g_dropped_names[i];
-		g_item_count++;
+		staged[staged_count].position = position;
+		staged[staged_count].name = g_dropped_names[i];
+		staged[staged_count].owned_name[0] = 0;
+		staged[staged_count].category = 0;
+		staged_count++;
 	}
+
+	esp_lock();
+	for (int i = 0; i < staged_count; i++) {
+		g_items[i] = staged[i];
+	}
+	g_item_count = staged_count;
+	g_items_alive = staged_count;
+	g_items_active = staged_count;
+	esp_unlock();
 }
 
 static ItemRepositionSeed_Awake_t original_item_seed_awake = NULL;
@@ -431,10 +924,21 @@ static ItemRepositionSeed_Awake_t original_item_seed_awake = NULL;
 static void __fastcall hooked_item_seed_awake(void *instance) {
 	g_item_ticks++;
 	g_item_spawn = instance;
-	/* New level: every dropped-item pointer from the old one is stale. */
+
+	/* New level: every pointer cached from the old one is stale. The
+	 * registry has to be cleared here too -- teardown doesn't reliably
+	 * deliver OnDestroy for every item, so entries would otherwise survive
+	 * into the next level and get called into. */
+	esp_lock();
 	for (int i = 0; i < ITEMSPAWN_ITEM_COUNT; i++) {
 		g_dropped[i] = NULL;
 	}
+	g_seed_item_count = 0;
+	g_found_count = 0;
+	/* Categories can legitimately differ per level, so don't carry the
+	 * remembered ones across. */
+	g_category_cache_count = 0;
+	esp_unlock();
 	original_item_seed_awake(instance);
 }
 
@@ -468,6 +972,42 @@ static void __fastcall hooked_item_spawn_update(void *instance) {
 	original_item_spawn_update(instance);
 }
 
+static ItemSeedData_ctor_t original_item_seed_data_ctor = NULL;
+static ItemSeedData_OnDestroy_t original_item_seed_data_on_destroy = NULL;
+
+/* Items register themselves as they're built. The fields aren't readable
+ * yet -- Unity assigns serialized values after the constructor -- so only
+ * the pointer is kept; name and category are read at collect time. */
+static void __fastcall hooked_item_seed_data_ctor(void *instance) {
+	original_item_seed_data_ctor(instance);
+
+	esp_lock();
+	/* Unambiguously an ItemSeedData right here, so this is where to learn
+	 * its class for the staleness check. */
+	if (!g_item_seed_data_klass && instance) {
+		g_item_seed_data_klass = *(void **)instance;
+	}
+	if (g_seed_item_count < ESP_MAX_SEED_ITEMS) {
+		g_seed_items[g_seed_item_count++] = instance;
+	}
+	esp_unlock();
+}
+
+/* ...and deregister when picked up or the level tears down. */
+static void __fastcall hooked_item_seed_data_on_destroy(void *instance) {
+	esp_lock();
+	for (int i = 0; i < g_seed_item_count; i++) {
+		if (g_seed_items[i] == instance) {
+			g_seed_items[i] = g_seed_items[g_seed_item_count - 1];
+			g_seed_item_count--;
+			break;
+		}
+	}
+	esp_unlock();
+
+	original_item_seed_data_on_destroy(instance);
+}
+
 static PickRay_Update_t original_pickray_update = NULL;
 
 /* The ESP's primary tick. Runs every frame on the main thread for as long
@@ -485,6 +1025,13 @@ static void __fastcall hooked_pickray_update(void *instance) {
 				esp_collect_items(g_item_spawn);
 			}
 		}
+	}
+
+	/* Compaction can't be left to the collect above: with Item ESP off that
+	 * never runs, dead entries accumulate, and once the array hits its cap
+	 * the .ctor hook silently discards every new item from then on. */
+	if (!esp_items_enabled) {
+		esp_prune_registry();
 	}
 
 	original_pickray_update(instance);
@@ -520,6 +1067,22 @@ int esp_install_hooks(void) {
 		return 0;
 	}
 
+	void *seed_ctor_target = (void *)(base + OFFSET_ItemSeedData_ctor);
+	if (MH_CreateHook(seed_ctor_target, (void *)&hooked_item_seed_data_ctor,
+	                  (void **)&original_item_seed_data_ctor) == MH_OK) {
+		MH_EnableHook(seed_ctor_target);
+	} else {
+		OutputDebugStringA("[cheat] MH_CreateHook(ItemSeedData::.ctor) failed");
+	}
+
+	void *seed_destroy_target = (void *)(base + OFFSET_ItemSeedData_OnDestroy);
+	if (MH_CreateHook(seed_destroy_target, (void *)&hooked_item_seed_data_on_destroy,
+	                  (void **)&original_item_seed_data_on_destroy) == MH_OK) {
+		MH_EnableHook(seed_destroy_target);
+	} else {
+		OutputDebugStringA("[cheat] MH_CreateHook(ItemSeedData::OnDestroy) failed");
+	}
+
 	void *pickray_target = (void *)(base + OFFSET_PickRay_Update);
 	if (MH_CreateHook(pickray_target, (void *)&hooked_pickray_update,
 	                  (void **)&original_pickray_update) != MH_OK) {
@@ -538,12 +1101,19 @@ int esp_install_hooks(void) {
 void esp_render(void) {
 	if (!esp_granny_enabled && !esp_items_enabled) return;
 
+	/* Held across the whole draw so the collected data can't be rewritten
+	 * from the game thread midway through reading it. The collector only
+	 * takes this to publish, never across its IL2CPP walk, so the wait here
+	 * is short. */
+	esp_lock();
+
 	if (!g_have_view_projection) {
 		/* Say so on screen rather than silently drawing nothing, so it's
 		 * obvious the overlay is alive and just missing data. */
 		ImDrawList *draw = ImGui::GetBackgroundDrawList();
 		draw->AddText(ImVec2(12.0f, 12.0f), IM_COL32(255, 160, 60, 255),
 		              "[esp] waiting for camera (is a level loaded?)");
+		esp_unlock();
 		return;
 	}
 
@@ -555,17 +1125,26 @@ void esp_render(void) {
 	if (esp_items_enabled) {
 		ImDrawList *draw = ImGui::GetBackgroundDrawList();
 		for (int i = 0; i < g_item_count; i++) {
+			if (!esp_category_shown(g_items[i].category)) continue;
+
 			float x, y;
 			if (!esp_world_to_screen(g_items[i].position, &x, &y)) continue;
 
-			const ImU32 color = IM_COL32(120, 220, 255, 255);
+			/* Fallback entries carry a static name; ItemSeedData ones carry
+			 * the game's own string. */
+			const char *label = g_items[i].name ? g_items[i].name : g_items[i].owned_name;
+			if (!label || !label[0]) label = "item";
+
+			const ImU32 color = esp_category_color(g_items[i].category);
 			draw->AddCircleFilled(ImVec2(x, y), 3.0f, color);
 			draw->AddCircle(ImVec2(x, y), 4.0f, IM_COL32(0, 0, 0, 200), 0, 1.5f);
 
-			ImVec2 text_size = ImGui::CalcTextSize(g_items[i].name);
+			ImVec2 text_size = ImGui::CalcTextSize(label);
 			ImVec2 text_pos(x - text_size.x * 0.5f, y + 6.0f);
-			draw->AddText(ImVec2(text_pos.x + 1, text_pos.y + 1), IM_COL32(0, 0, 0, 200), g_items[i].name);
-			draw->AddText(text_pos, color, g_items[i].name);
+			draw->AddText(ImVec2(text_pos.x + 1, text_pos.y + 1), IM_COL32(0, 0, 0, 200), label);
+			draw->AddText(text_pos, color, label);
 		}
 	}
+
+	esp_unlock();
 }

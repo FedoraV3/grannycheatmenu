@@ -40,6 +40,10 @@ static uintptr_t wait_for_module(const wchar_t *name, int max_tries, DWORD sleep
 static DWORD WINAPI main_thread(LPVOID param) {
     (void)param;
 
+    /* Before any hook that can reach esp_collect() is enabled, since the
+     * ESP's cross-thread state needs its lock to exist first. */
+    esp_init();
+
     if (!d3d11_hook_install()) {
         OutputDebugStringA("[cheat] d3d11 hook failed, menu will not render");
     }

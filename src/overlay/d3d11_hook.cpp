@@ -33,9 +33,31 @@ static WNDPROC g_original_wndproc = nullptr;
 static bool g_imgui_initialized = false;
 static bool g_menu_visible = false;
 
-/* Implemented. */
-bool granny_cannot_kill_you = false;
-bool stop_granny_ai = false;
+/* ImGui has one global context and is not thread-safe, but we touch it from
+ * two threads: menu_wndproc runs on whichever thread pumps the game's
+ * message loop (Unity's main thread), while render_frame runs on the D3D11
+ * present thread.
+ *
+ * ImGui_ImplWin32_WndProcHandler pushes into g.InputEventsQueue -- an
+ * ImVector -- exactly while NewFrame() is draining and clearing it. That
+ * race trips an "i >= 0 && i < Size" assert deep inside ImVector, far from
+ * anything that looks like the cause. This serialises the two. */
+static CRITICAL_SECTION g_imgui_lock;
+static bool g_imgui_lock_ready = false;
+
+/* Implemented.
+ *
+ * "Immortality" rather than something Granny-specific: the byte patch lands
+ * on PlayerStatus::NormalDeath and ::KnockDeath, which are the game's
+ * generic death paths, not hers. Confirmed in game by surviving the
+ * third-floor fake-floor trap, which kills by fall damage with Granny
+ * nowhere near. The two catch hooks it also toggles are hers, but the death
+ * patch is what does the heavy lifting. */
+bool immortality = false;
+
+/* Set when Stop granny is clicked with no live instance, so the menu can
+ * say why nothing happened instead of appearing to ignore the click. */
+static bool g_stop_granny_failed = false;
 
 /* WIP -- these are UI placeholders only. Nothing is wired up behind them
  * yet, so they render greyed out via wip_checkbox()/wip_slider() below.
@@ -86,17 +108,26 @@ static void release_render_target() {
  * messages won't stop camera movement in that case. Not handled here.
  */
 static LRESULT CALLBACK menu_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
-    if (g_menu_visible) {
+    if (g_menu_visible && g_imgui_lock_ready) {
+        bool swallow = false;
+
+        /* Held only across the ImGui calls, not CallWindowProcW -- passing a
+         * message down to the game while holding this would invite a
+         * deadlock. */
+        EnterCriticalSection(&g_imgui_lock);
         if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam)) {
-            return TRUE;
+            swallow = true;
+        } else {
+            ImGuiIO &io = ImGui::GetIO();
+            if (io.WantCaptureMouse && msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) {
+                swallow = true;
+            } else if (io.WantCaptureKeyboard && msg >= WM_KEYFIRST && msg <= WM_KEYLAST) {
+                swallow = true;
+            }
         }
-        ImGuiIO &io = ImGui::GetIO();
-        if (io.WantCaptureMouse && msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) {
-            return TRUE;
-        }
-        if (io.WantCaptureKeyboard && msg >= WM_KEYFIRST && msg <= WM_KEYLAST) {
-            return TRUE;
-        }
+        LeaveCriticalSection(&g_imgui_lock);
+
+        if (swallow) return TRUE;
     }
     return CallWindowProcW(g_original_wndproc, hwnd, msg, wparam, lparam);
 }
@@ -104,8 +135,31 @@ static LRESULT CALLBACK menu_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
 /* Runs once, the first time hooked_present fires -- this is the earliest
  * point we have a live device/context/window to hand ImGui. */
 static void init_imgui(IDXGISwapChain *swap_chain) {
-    swap_chain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void **>(&g_device));
+    /* Must be ready before the window proc is subclassed at the end of this
+     * function, since that's the moment the other thread can start calling
+     * into ImGui. Guarded because the failure paths below leave
+     * g_imgui_initialized false, so this function can be entered again on a
+     * later Present -- re-initialising a live CRITICAL_SECTION is undefined. */
+    if (!g_imgui_lock_ready) {
+        InitializeCriticalSection(&g_imgui_lock);
+        g_imgui_lock_ready = true;
+    }
+
+    /* Bail rather than dereference a null device -- and leave
+     * g_imgui_initialized false so the next Present retries instead of
+     * faulting here every frame. */
+    if (FAILED(swap_chain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void **>(&g_device))) ||
+        !g_device) {
+        OutputDebugStringA("[cheat] IDXGISwapChain::GetDevice failed, ImGui not initialized");
+        return;
+    }
     g_device->GetImmediateContext(&g_context);
+    if (!g_context) {
+        OutputDebugStringA("[cheat] GetImmediateContext failed, ImGui not initialized");
+        g_device->Release();
+        g_device = nullptr;
+        return;
+    }
 
     DXGI_SWAP_CHAIN_DESC desc;
     swap_chain->GetDesc(&desc);
@@ -148,20 +202,24 @@ static void wip_slider(const char *label, float *value, float min, float max) {
 }
 
 static void draw_player_tab() {
-	if (ImGui::Checkbox("Granny cannot kill you", &granny_cannot_kill_you)) {
+	if (ImGui::Checkbox("Immortality", &immortality)) {
 		uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
-		if (granny_cannot_kill_you) {
+
+		/* The two catch paths stay detours -- they substitute real behaviour
+		 * (ResetAIDecision) rather than just suppressing the original. */
+		if (immortality) {
 			MH_EnableHook(reinterpret_cast<LPVOID>(base + OFFSET_PlayerStatus_GrannyCaughtYou));
 			MH_EnableHook(reinterpret_cast<LPVOID>(base + OFFSET_PlayerStatus_GrannyCaughtYouBed));
-
-			MH_EnableHook(reinterpret_cast<LPVOID>(base + OFFSET_PlayerStatus_NormalDeath));
-			MH_EnableHook(reinterpret_cast<LPVOID>(base + OFFSET_PlayerStatus_KnockDeath));
 		} else {
 			MH_DisableHook(reinterpret_cast<LPVOID>(base + OFFSET_PlayerStatus_GrannyCaughtYou));
 			MH_DisableHook(reinterpret_cast<LPVOID>(base + OFFSET_PlayerStatus_GrannyCaughtYouBed));
+		}
 
-			MH_DisableHook(reinterpret_cast<LPVOID>(base + OFFSET_PlayerStatus_KnockDeath));
-			MH_DisableHook(reinterpret_cast<LPVOID>(base + OFFSET_PlayerStatus_NormalDeath));
+		/* The two death paths are pure suppression, so they're byte patched
+		 * instead of hooked -- no trampoline, two fewer hooks. */
+		if (!granny_set_death_disabled(immortality)) {
+			OutputDebugStringA("[cheat] death patch failed, reverting toggle");
+			immortality = !immortality;
 		}
 	}
 
@@ -173,24 +231,30 @@ static void draw_player_tab() {
 }
 
 static void draw_granny_tab() {
-	if (ImGui::Checkbox("Stop granny", &stop_granny_ai)) {
-		if (stop_granny_ai) {
-			void *granny = ai_granny_current();
-			if (granny) {
-				uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
-				AI_Granny_StopAI_t stop_ai = (AI_Granny_StopAI_t)(base + OFFSET_AI_Granny_StopAI);
-				stop_ai(granny);
-				OutputDebugStringA("[cheat] StopAI called");
-			} else {
-				OutputDebugStringA("[cheat] no AI_Granny instance yet, can't call StopAI");
-				stop_granny_ai = false;
-			}
+	/* A button, not a checkbox: StopAI is one-shot and irreversible, so a
+	 * checkbox would imply unchecking undoes it, which it never did. The old
+	 * one also silently reverted itself when she wasn't spawned, which just
+	 * looked like it refused to turn on. */
+	if (granny_is_stopped()) {
+		ImGui::BeginDisabled();
+		ImGui::Button("Stop granny");
+		ImGui::EndDisabled();
+		ImGui::SameLine();
+		ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1.0f), "stopped");
+	} else if (ImGui::Button("Stop granny")) {
+		if (!granny_stop_ai()) {
+			/* Only fails when nothing is ticking -- she isn't spawned, or
+			 * she's switched off in the game's own options. */
+			g_stop_granny_failed = true;
 		} else {
-			/* StopAI tears down her components one-way (see offsets.h) --
-			 * there's no confirmed function that undoes it yet, so
-			 * unchecking just stops re-triggering it. She stays stopped. */
-			OutputDebugStringA("[cheat] Stop granny unchecked -- no known re-enable function yet, she stays stopped");
+			g_stop_granny_failed = false;
 		}
+	}
+
+	ImGui::TextDisabled("Permanent -- she returns only on respawn or restart.");
+	if (g_stop_granny_failed) {
+		ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.35f, 1.0f),
+		                   "No Granny in the level right now.");
 	}
 
 	/* Re-applied every FixedUpdate tick rather than on toggle, since the
@@ -216,6 +280,15 @@ static void draw_visuals_tab() {
 	 * status line saying so, rather than nothing at all. */
 	ImGui::Checkbox("Granny ESP", &esp_granny_enabled);
 	ImGui::Checkbox("Item ESP", &esp_items_enabled);
+
+	/* Categories are the game's own, straight off ItemSeedData::category. */
+	ImGui::Indent();
+	ImGui::TextDisabled("Item categories");
+	ImGui::Checkbox("Escape only", &esp_show_escape_items);
+	ImGui::Checkbox("Escape + puzzle", &esp_show_escape_puzzle_items);
+	ImGui::Checkbox("Puzzle only", &esp_show_puzzle_items);
+	ImGui::Checkbox("Other / free", &esp_show_other_items);
+	ImGui::Unindent();
 
 	/* Her model's real height in world units isn't something we can read
 	 * cheaply, so tune the box by eye instead of rebuilding to guess. */
@@ -328,6 +401,10 @@ static void draw_menu() {
 }
 
 static void render_frame() {
+    /* Locked for the whole frame: NewFrame drains the input queue that the
+     * window proc pushes into from the game's thread. */
+    EnterCriticalSection(&g_imgui_lock);
+
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
@@ -342,6 +419,8 @@ static void render_frame() {
     ImGui::Render();
     g_context->OMSetRenderTargets(1, &g_render_target, nullptr);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+    LeaveCriticalSection(&g_imgui_lock);
 }
 
 static HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swap_chain, UINT sync_interval, UINT flags) {
@@ -372,12 +451,22 @@ static HRESULT STDMETHODCALLTYPE hooked_resize_buffers(IDXGISwapChain *swap_chai
                                                           UINT swap_chain_flags) {
     /* The render target holds a reference into the old back buffer --
      * ResizeBuffers fails if anything still references it, so drop it
-     * first and recreate against the new buffers afterward. */
+     * first and recreate against the new buffers afterward.
+     *
+     * Locked because this runs on the game's thread while render_frame may
+     * be mid-draw on the present thread: releasing the view out from under
+     * an in-flight OMSetRenderTargets/RenderDrawData pair frees a COM
+     * object the GPU submit still refers to. */
+    bool locked = g_imgui_lock_ready;
+    if (locked) EnterCriticalSection(&g_imgui_lock);
+
     release_render_target();
     HRESULT hr = original_resize_buffers(swap_chain, buffer_count, width, height, new_format, swap_chain_flags);
     if (g_imgui_initialized) {
         create_render_target(swap_chain);
     }
+
+    if (locked) LeaveCriticalSection(&g_imgui_lock);
     return hr;
 }
 

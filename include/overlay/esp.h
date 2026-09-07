@@ -30,6 +30,19 @@ extern bool esp_fullbright_enabled;
 extern bool esp_items_ignore_active;
 
 /**
+ * Per-category item filters, keyed on ItemSeedData::category -- the game's
+ * own classification, per its tooltip: 1 = escape-only, 2 = escape+puzzle,
+ * 3 = puzzle-only, anything else free/misc.
+ *
+ * These only bite when items come from the ItemSeedData registry. The
+ * fallback sources have no category, so they all land in "other".
+ */
+extern bool esp_show_escape_items;
+extern bool esp_show_escape_puzzle_items;
+extern bool esp_show_puzzle_items;
+extern bool esp_show_other_items;
+
+/**
  * Debug aid: log each item slot to OutputDebugStringA before touching it.
  *
  * If the item walk crashes the game, DebugView's last line names the exact
@@ -64,6 +77,16 @@ extern float esp_box_width_ratio;
  *
  * @param vp The combined view-projection matrix, or NULL to mark it stale.
  */
+/**
+ * @brief Initialise the ESP's internal lock. Call once before any hook that
+ * can reach esp_collect() is enabled.
+ *
+ * The collected state crosses threads -- the game thread fills it, the
+ * present thread draws it -- so it needs a lock, and that lock has to exist
+ * before the first collection can run.
+ */
+void esp_init(void);
+
 void esp_set_view_projection(const esp_mat4 *vp);
 
 /**

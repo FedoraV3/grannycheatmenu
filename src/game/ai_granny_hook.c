@@ -1,5 +1,6 @@
 #include "game/ai_granny_hook.h"
 #include "game/offsets.h"
+#include "core/patch_local.h"
 #include "overlay/esp.h"
 #include "MinHook.h"
 
@@ -8,10 +9,29 @@
 static AI_Granny_FixedUpdate_t original_fixed_update = NULL;
 static PlayerStatus_GrannyCaughtYou_t original_granny_caught_you = NULL;
 static PlayerStatus_GrannyCaughtYouBed_t original_granny_caught_you_bed = NULL;
-static PlayerStatus_NormalDeath_t original_granny_normal_death = NULL;
-static PlayerStatus_KnockDeath_t original_granny_knock_death = NULL;
 static void *volatile g_granny_instance = NULL;
 static uintptr_t g_gameassembly_base = 0;
+
+/*
+ * NormalDeath and KnockDeath are disabled by byte patch rather than by a
+ * MinHook detour. Both were pure no-op detours -- they existed only to stop
+ * the original running -- so writing `ret` over the entry point does the
+ * same job without a trampoline, and saves two hooks.
+ *
+ * `ret` (0xC3), not NOP: these are `void f(void *this)` under the Win64 ABI,
+ * where the caller cleans the stack and nothing has been pushed at entry, so
+ * returning immediately is safe. NOPing the first instruction would only
+ * skip it and fall through into the rest of the function.
+ *
+ * GrannyCaughtYou and GrannyCaughtYouBed stay as detours: they don't just
+ * suppress the original, they call ResetAIDecision, which needs real code.
+ */
+#define DEATH_PATCH_SIZE 1
+static const uint8_t g_ret_patch[DEATH_PATCH_SIZE] = { 0xC3 };
+
+static uint8_t g_normal_death_original[DEATH_PATCH_SIZE];
+static uint8_t g_knock_death_original[DEATH_PATCH_SIZE];
+static bool g_death_patched = false;
 
 /* Bound to the "Blind" checkbox in the Granny tab. Applied every tick in
  * hooked_fixed_update rather than once on toggle, because BlindTimer means
@@ -59,16 +79,6 @@ static void __fastcall granny_caught_you(void *instance) {
 	}
 }
 
-static void __fastcall granny_normal_death(void *instance) {
-	(void)instance;
-	return;
-}
-
-static void __fastcall granny_knocked_death(void *instance) {
-	(void)instance;
-	return;
-}
-
 static void __fastcall granny_caught_you_bed(void *instance) {
 	// yeah i just wont let that happen
 	(void)instance;
@@ -107,15 +117,8 @@ int ai_granny_hook_install(void) {
 		OutputDebugStringA("[cheat] MH_CreateHook(PlayerStatus::GrannyCaughtYouBed failed");
 	}
 	
-	if (MH_CreateHook((LPVOID)(base + OFFSET_PlayerStatus_NormalDeath), (void *)&granny_normal_death,
-					  (void **)&original_granny_normal_death) != MH_OK) {
-		OutputDebugStringA("[cheat] MH_CreateHook(PlayerStatus::GrannyNormalDeath failed");
-	}
-	
-	if (MH_CreateHook((LPVOID)(base + OFFSET_PlayerStatus_KnockDeath), (void *)&granny_knocked_death,
-					  (void **)&original_granny_knock_death) != MH_OK) {
-		OutputDebugStringA("[cheat] MH_CreateHook(PlayerStatus::GrannyKnockDeath failed");
-	}
+	/* NormalDeath and KnockDeath deliberately get no hook -- they're byte
+	 * patched instead, in granny_set_death_disabled(). */
 
     if (MH_EnableHook((LPVOID)(base + OFFSET_AI_Granny_FixedUpdate)) != MH_OK) {
         OutputDebugStringA("[cheat] MH_EnableHook(AI_Granny::FixedUpdate) failed");
@@ -128,4 +131,67 @@ int ai_granny_hook_install(void) {
 
 void *ai_granny_current(void) {
     return g_granny_instance;
+}
+
+/* The instance StopAI was called on. Compared against the live one so the
+ * "stopped" state clears itself when the game builds a new AI_Granny. */
+static void *g_stopped_instance = NULL;
+
+bool granny_stop_ai(void) {
+	if (g_gameassembly_base == 0) return false;
+
+	void *granny = ai_granny_current();
+	if (!granny) {
+		OutputDebugStringA("[cheat] no AI_Granny instance yet, can't call StopAI");
+		return false;
+	}
+
+	((AI_Granny_StopAI_t)(g_gameassembly_base + OFFSET_AI_Granny_StopAI))(granny);
+	g_stopped_instance = granny;
+	OutputDebugStringA("[cheat] StopAI called");
+	return true;
+}
+
+bool granny_is_stopped(void) {
+	if (!g_stopped_instance) return false;
+
+	/* A different (or absent) instance means the game replaced her, so
+	 * whatever we stopped is gone and this one is untouched. */
+	void *current = ai_granny_current();
+	if (current != g_stopped_instance) {
+		g_stopped_instance = NULL;
+		return false;
+	}
+	return true;
+}
+
+bool granny_set_death_disabled(bool disabled) {
+	if (g_gameassembly_base == 0) return false;
+	/* Idempotent: patching twice would save the `ret` as the "original"
+	 * byte and make the restore permanent. */
+	if (disabled == g_death_patched) return true;
+
+	uintptr_t normal_death = g_gameassembly_base + OFFSET_PlayerStatus_NormalDeath;
+	uintptr_t knock_death = g_gameassembly_base + OFFSET_PlayerStatus_KnockDeath;
+
+	if (disabled) {
+		if (!patch_bytes_local(normal_death, g_ret_patch, DEATH_PATCH_SIZE, g_normal_death_original)) {
+			OutputDebugStringA("[cheat] failed to patch PlayerStatus::NormalDeath");
+			return false;
+		}
+		if (!patch_bytes_local(knock_death, g_ret_patch, DEATH_PATCH_SIZE, g_knock_death_original)) {
+			OutputDebugStringA("[cheat] failed to patch PlayerStatus::KnockDeath");
+			/* Don't leave one of the pair patched. */
+			restore_bytes_local(normal_death, g_normal_death_original, DEATH_PATCH_SIZE);
+			return false;
+		}
+		g_death_patched = true;
+		OutputDebugStringA("[cheat] NormalDeath/KnockDeath patched to ret");
+	} else {
+		restore_bytes_local(normal_death, g_normal_death_original, DEATH_PATCH_SIZE);
+		restore_bytes_local(knock_death, g_knock_death_original, DEATH_PATCH_SIZE);
+		g_death_patched = false;
+		OutputDebugStringA("[cheat] NormalDeath/KnockDeath restored");
+	}
+	return true;
 }

@@ -9,6 +9,51 @@ extern "C" {
 extern bool granny_is_blind;
 
 /**
+ * @brief Disable or restore PlayerStatus::NormalDeath and ::KnockDeath by
+ * byte patch.
+ *
+ * Both are pure suppression -- nothing needs to run in their place -- so
+ * writing `ret` (0xC3) over the entry point replaces what used to be two
+ * no-op MinHook detours, with no trampoline and no per-call cost. The
+ * original bytes are saved on patch and written back on restore.
+ *
+ * `ret` rather than NOP because these are `void f(void *this)` under the
+ * Win64 ABI: the caller cleans the stack and nothing is pushed at entry, so
+ * returning immediately is safe, whereas a NOP would just fall through into
+ * the rest of the function.
+ *
+ * Idempotent -- calling it twice with the same value is a no-op, which
+ * matters because a second patch would record the `ret` itself as the
+ * "original" byte and make the damage permanent.
+ *
+ * @param disabled true to patch the death paths out, false to restore them.
+ * @return true on success; false if the module base isn't resolved yet or a
+ *         write failed (in which case neither function is left patched).
+ */
+bool granny_set_death_disabled(bool disabled);
+
+/**
+ * @brief Call AI_Granny::StopAI on the live instance, halting her for good.
+ *
+ * One-shot and irreversible: StopAI tears her components down and no
+ * function has been found that undoes it. She only comes back when the game
+ * builds a fresh AI_Granny -- on respawn into a new day, or a restart.
+ *
+ * @return true if she was stopped; false if no instance is currently
+ *         ticking (she isn't spawned, or is disabled in the game options).
+ */
+bool granny_stop_ai(void);
+
+/**
+ * @brief Whether the instance we stopped is still the one in play.
+ *
+ * Goes false by itself once the game swaps in a new AI_Granny, since that
+ * instance was never stopped -- which is how a respawn or restart clears
+ * the state without us needing to detect either event directly.
+ */
+bool granny_is_stopped(void);
+
+/**
  * @brief Hook AI_Granny::FixedUpdate to keep a live pointer to the current
  * AI_Granny instance.
  *
