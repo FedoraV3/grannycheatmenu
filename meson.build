@@ -49,6 +49,8 @@ cheat_sources = [
     'src/core/patch_local.c',
 
     'src/game/ai_granny_hook.c',
+    'src/game/fullbright.c',
+    'src/game/granny_ai.c',
 
     'src/overlay/d3d11_hook.cpp',
     'src/overlay/esp.cpp',

@@ -17,7 +17,6 @@ typedef struct {
 /* Feature toggles -- the menu binds checkboxes straight to these. */
 extern bool esp_granny_enabled;
 extern bool esp_items_enabled;
-extern bool esp_fullbright_enabled;
 
 /**
  * Debug aid: draw items that are alive but not active in the hierarchy.

@@ -1,5 +1,6 @@
 #include "overlay/esp.h"
 #include "game/ai_granny_hook.h"
+#include "game/fullbright.h"
 #include "game/offsets.h"
 #include "MinHook.h"
 
@@ -10,7 +11,6 @@
 
 bool esp_granny_enabled = false;
 bool esp_items_enabled = false;
-bool esp_fullbright_enabled = false;
 bool esp_items_ignore_active = false;
 bool esp_items_verbose = false;
 
@@ -1016,6 +1016,10 @@ static PickRay_Update_t original_pickray_update = NULL;
 static void __fastcall hooked_pickray_update(void *instance) {
 	g_pickray_ticks++;
 	g_pickray = instance;
+
+	/* Main thread, so this is where RenderSettings can safely be touched --
+	 * the checkbox itself is clicked on the present thread. */
+	fullbright_tick(instance);
 
 	if (esp_granny_enabled || esp_items_enabled) {
 		uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");

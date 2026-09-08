@@ -214,6 +214,44 @@ static const uintptr_t OFFSET_GameObject_GetComponent_shared  = 0x2B7FD0;
 static const uintptr_t METHODINFO_GetComponent_ItemSeedData   = 0xC338B8;
 typedef void(__fastcall *GameObject_GetComponent_t)(void *object, void *out_component, void *method);
 
+/*
+ * UnityEngine.RenderSettings -- static scene lighting, used for fullbright.
+ *
+ * Only fog and ambientMode have getters, so those are the only originals
+ * that can be saved for a restore. That's enough: with the mode put back to
+ * whatever it was (Skybox, normally) the ambient colour and intensity stop
+ * being used, so not restoring them changes nothing visible.
+ *
+ * These are static UnityEngine methods, so each takes its value plus a
+ * trailing MethodInfo*, and NULL is accepted for it.
+ */
+static const uintptr_t OFFSET_RenderSettings_get_fog           = 0x712200;
+static const uintptr_t OFFSET_RenderSettings_set_fog           = 0x7123F0;
+static const uintptr_t OFFSET_RenderSettings_get_ambientMode   = 0x712020;
+static const uintptr_t OFFSET_RenderSettings_set_ambientMode   = 0x7122F0;
+static const uintptr_t OFFSET_RenderSettings_set_ambientIntensity = 0x712230;
+static const uintptr_t OFFSET_RenderSettings_set_ambientLight  = 0x7122B0;
+
+/**
+ * AmbientMode. Note Flat is 3, NOT 2 -- the enum is
+ * Skybox=0, Trilight=1, Flat=3, Custom=4, with 2 unused. Passing 0 would
+ * select Skybox and appear to do nothing.
+ */
+#define UNITY_AMBIENT_MODE_FLAT 3
+
+/** UnityEngine.Color -- four floats. */
+typedef struct {
+	float r, g, b, a;
+} unity_color;
+
+typedef bool(__fastcall *RenderSettings_get_fog_t)(void *method);
+typedef void(__fastcall *RenderSettings_set_fog_t)(bool value, void *method);
+typedef int(__fastcall *RenderSettings_get_ambientMode_t)(void *method);
+typedef void(__fastcall *RenderSettings_set_ambientMode_t)(int value, void *method);
+typedef void(__fastcall *RenderSettings_set_float_t)(float value, void *method);
+/* Color is 16 bytes, so the Win64 ABI passes it by reference, not by value. */
+typedef void(__fastcall *RenderSettings_set_color_t)(const unity_color *value, void *method);
+
 /**
  * UnityEngine.Object::FindObjectsOfType(Type, bool includeInactive).
  *

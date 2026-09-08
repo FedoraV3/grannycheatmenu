@@ -1,5 +1,7 @@
 #include "overlay/d3d11_hook.h"
 #include "game/ai_granny_hook.h"
+#include "game/fullbright.h"
+#include "game/granny_ai.h"
 #include "game/offsets.h"
 #include "overlay/esp.h"
 #include "MinHook.h"
@@ -69,12 +71,9 @@ static float wip_player_speed = 1.0f;
 
 static bool wip_granny_deaf = false;
 static bool wip_freeze_in_place = false;
-static float wip_granny_speed = 1.0f;
 
-static bool wip_reveal_items = false;
 static bool wip_disable_traps = false;
 
-static bool wip_fullbright = false;
 
 static void create_render_target(IDXGISwapChain *swap_chain) {
     ID3D11Texture2D *back_buffer = nullptr;
@@ -261,16 +260,34 @@ static void draw_granny_tab() {
 	 * game's BlindTimer clears IsBlind by itself. */
 	ImGui::Checkbox("Blind (ignore sight)", &granny_is_blind);
 
+	/* Applied on the game thread by granny_ai_tick(). The sliders seed
+	 * themselves from her real speeds the first time she's seen, so they
+	 * start at the difficulty's values rather than arbitrary ones. */
+	bool speed_changed = ImGui::Checkbox("Override speed", &granny_speed_enabled);
+	ImGui::BeginDisabled(!granny_speed_enabled);
+	speed_changed |= ImGui::SliderFloat("Walk speed", &granny_walk_speed, 0.0f, 500.0f, "%.2f");
+	speed_changed |= ImGui::SliderFloat("Run speed", &granny_run_speed, 0.0f, 500.0f, "%.2f");
+	ImGui::EndDisabled();
+	if (granny_speed_enabled) {
+		/* Ctrl+click a slider to type an exact value -- dragging to a
+		 * specific number is hopeless over a 0..500 range. */
+		ImGui::TextDisabled("Ctrl+click a slider to type a value.");
+	}
+	/* The write happens on the game thread, and only when something has
+	 * actually changed -- not every tick. */
+	if (speed_changed) granny_speed_mark_dirty();
+	if (granny_speed_enabled) {
+		ImGui::TextDisabled("Unchecking restores her original speeds.");
+	}
+
 	ImGui::Separator();
 	ImGui::TextDisabled("Planned");
 	wip_checkbox("Freeze in place", &wip_freeze_in_place);
 	wip_checkbox("Deaf (ignore sound)", &wip_granny_deaf);
-	wip_slider("Granny speed", &wip_granny_speed, 0.1f, 3.0f);
 }
 
 static void draw_world_tab() {
 	ImGui::TextDisabled("Planned");
-	wip_checkbox("Reveal item locations", &wip_reveal_items);
 	wip_checkbox("Disable traps", &wip_disable_traps);
 }
 
@@ -309,8 +326,9 @@ static void draw_visuals_tab() {
 	}
 
 	ImGui::Separator();
-	ImGui::TextDisabled("Planned");
-	wip_checkbox("Fullbright", &wip_fullbright);
+	/* Applied on the game's main thread by fullbright_tick(); this only
+	 * flips the flag. */
+	ImGui::Checkbox("Fullbright", &fullbright_enabled);
 }
 
 /* Live state, for working out what's actually resolved at runtime while

@@ -1,4 +1,5 @@
 #include "game/ai_granny_hook.h"
+#include "game/granny_ai.h"
 #include "game/offsets.h"
 #include "core/patch_local.h"
 #include "overlay/esp.h"
@@ -59,6 +60,10 @@ static void __fastcall hooked_fixed_update(void *instance) {
 	if (granny_is_blind && instance != NULL) {
 		*(volatile bool *)((uintptr_t)instance + FIELD_AI_Granny_IsBlind) = true;
 	}
+
+	/* Writes only when she's been rebuilt or a control changed -- see
+	 * granny_ai_tick(). */
+	granny_ai_tick(instance);
 
     original_fixed_update(instance);
 }
