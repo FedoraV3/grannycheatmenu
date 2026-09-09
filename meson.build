@@ -46,11 +46,16 @@ dwmapi_dep = cpp.find_library('dwmapi')             # Dwm* calls, used by ImGui'
 #   overlay -- the D3D11 present hook, ImGui menu, and ESP rendering
 cheat_sources = [
     'src/core/dllmain.c',
+    'src/core/config.c',
+    'src/core/keybinds.c',
     'src/core/patch_local.c',
 
     'src/game/ai_granny_hook.c',
     'src/game/fullbright.c',
     'src/game/granny_ai.c',
+    'src/game/player.c',
+    'src/game/spawn.c',
+    'src/game/traps.c',
 
     'src/overlay/d3d11_hook.cpp',
     'src/overlay/esp.cpp',

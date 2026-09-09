@@ -23,6 +23,16 @@ extern float granny_walk_speed;
 extern float granny_run_speed;
 
 /**
+ * Bound to the Granny tab's "Freeze in place" checkbox.
+ *
+ * Takes precedence over the speed override while it's on, and shares its
+ * saved originals, so unfreezing puts back whatever the game actually chose
+ * rather than a guess. Unlike the speed override this one is re-asserted
+ * every tick -- see granny_ai_tick().
+ */
+extern bool granny_freeze_enabled;
+
+/**
  * @brief Apply the speed override when it needs applying, and restore her
  * original speeds when it's switched off.
  *

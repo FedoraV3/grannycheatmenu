@@ -18,6 +18,27 @@ typedef struct {
 extern bool esp_granny_enabled;
 extern bool esp_items_enabled;
 
+/** Box around the cellar's Mom Spider, from its own AI_MomSpider::Update. */
+extern bool esp_momspider_enabled;
+
+/**
+ * Off-screen direction arrows.
+ *
+ * A box only helps while the thing is in front of you, which is the case you
+ * least need help with. When an enemy is off the edge of the screen -- or
+ * behind you, where the projection would otherwise mirror it to the wrong
+ * side entirely -- this puts an arrow on the screen edge pointing at them,
+ * with the distance next to it.
+ *
+ * Applies to whichever enemies are switched on above; it doesn't add
+ * markers of its own.
+ */
+extern bool esp_arrows_enabled;
+
+/** Arrow size in pixels, and how far its ring sits from the screen edge. */
+extern float esp_arrow_size;
+extern float esp_arrow_margin;
+
 /**
  * Debug aid: draw items that are alive but not active in the hierarchy.
  *
@@ -65,6 +86,11 @@ extern int esp_item_scan_limit;
  */
 extern float esp_box_height;
 extern float esp_box_width_ratio;
+
+/** The same, for the Mom Spider -- she's low and wide where Granny is tall
+ *  and narrow, so one pair of numbers can't flatter both. */
+extern float esp_spider_box_height;
+extern float esp_spider_box_width_ratio;
 
 /**
  * @brief Feed the camera's view-projection matrix for this frame.
@@ -146,6 +172,8 @@ int esp_install_hooks(void);
 typedef struct {
 	bool have_view_projection;  /**< A camera matrix has been captured. */
 	bool have_granny_position;  /**< Granny's transform position was read. */
+	bool have_spider_position;  /**< The Mom Spider's position was read. */
+	bool have_player_position;  /**< The player's own position, for distances. */
 	int item_count;             /**< Items drawn (passed every filter). */
 	int items_alive;            /**< Of 55 slots, how many are live objects. */
 	int items_active;           /**< Of those, how many are active in a scene. */
@@ -156,6 +184,7 @@ typedef struct {
 	unsigned long granny_ticks; /**< AI_Granny::FixedUpdate hook call count. */
 	unsigned long item_ticks;   /**< ItemRepositionSeed::Awake hook call count. */
 	unsigned long pickray_ticks;/**< PickRay::Update hook call count (primary tick). */
+	unsigned long spider_ticks; /**< AI_MomSpider::Update hook call count. */
 } esp_debug_info;
 
 /**

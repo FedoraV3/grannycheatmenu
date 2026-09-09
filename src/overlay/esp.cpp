@@ -2,6 +2,7 @@
 #include "game/ai_granny_hook.h"
 #include "game/fullbright.h"
 #include "game/offsets.h"
+#include "game/spawn.h"
 #include "MinHook.h"
 
 #include <windows.h>
@@ -11,6 +12,10 @@
 
 bool esp_granny_enabled = false;
 bool esp_items_enabled = false;
+bool esp_momspider_enabled = false;
+bool esp_arrows_enabled = true;
+float esp_arrow_size = 26.0f;
+float esp_arrow_margin = 60.0f;
 bool esp_items_ignore_active = false;
 bool esp_items_verbose = false;
 
@@ -27,11 +32,25 @@ int esp_item_scan_limit = ITEMSEED_ITEM_COUNT;
 float esp_box_height = 4.65f;
 float esp_box_width_ratio = 0.50f;
 
+/* The Mom Spider is a low, wide thing where Granny is tall and narrow, so
+ * she gets her own pair rather than being drawn as a squashed Granny. */
+float esp_spider_box_height = 1.60f;
+float esp_spider_box_width_ratio = 1.80f;
+
 static esp_mat4 g_view_projection;
 static bool g_have_view_projection = false;
 
 static esp_vec3 g_granny_position;
 static bool g_have_granny_position = false;
+
+static esp_vec3 g_spider_position;
+static bool g_have_spider_position = false;
+
+/* The player's own world position, taken from the PickRay's transform -- it
+ * is a component on the player, so its transform is the player's. Only used
+ * for the distance shown beside a direction arrow. */
+static esp_vec3 g_player_position;
+static bool g_have_player_position = false;
 
 /* Names for ItemRepositionSeed's 35 Transform* fields, in declaration order
  * -- index N is the field at ITEMSEED_FIRST_ITEM_FIELD + N * 8. */
@@ -45,27 +64,9 @@ static const char *const g_item_names[ITEMSEED_ITEM_COUNT] = {
 	"EC Key", "Fuse",
 };
 
-/* Names for dropped items, indexed by CountItem - 1.
- *
- * ORDER COMES FROM ItemSpawn::Update's dispatch chain, NOT from dump.cs's
- * field declaration order -- the two disagree. The decompile maps 29 to
- * shotgun and 30 to shotgun2 (dump.cs declares shotgun2 after sp3), and 53
- * to ornamentfreeze before 54 ornamentbomb (dump.cs has bomb first). Taking
- * the declaration order mislabelled slots 29-32 and 52-53.
- *
- * Wording matches g_item_names above where it's the same item, so an item
- * doesn't rename itself when you drop it. */
-static const char *const g_dropped_names[ITEMSPAWN_ITEM_COUNT] = {
-	"Crossbow", "Pliers", "Battery", "Gas", "Bird Seed", "Book", "Winch",
-	"Car Battery", "Car Key", "Chain Cutter", "Code", "Baton", "EC Key",
-	"Hammer", "Padlock Key", "Master Key", "Cog 1", "Cog 2", "Meat",
-	"Melon", "Spray", "Plank", "Playhouse Key", "Remote", "Robo Data",
-	"Rusty Key", "Safe Key", "Screwdriver", "Shotgun", "Shotgun 2",
-	"SP 1", "SP 2", "SP 3", "Spark Plug", "Special", "Spider", "Syringe",
-	"T1", "T2", "T3", "T4", "Teddy", "Text", "Topp", "WP Key", "Vase",
-	"Vase 2", "Vase 3", "Wheel Crank", "Wooden Stick", "Wrench", "Rat",
-	"Freeze Ornament", "Bomb Ornament", "Fuse",
-};
+/* Dropped-item names now live in spawn.c, which needs the same table to
+ * fill the spawn list -- one copy, keyed to ItemSpawn's dispatch order,
+ * rather than two that can drift apart. */
 
 /* GameObject per dropped item, indexed by CountItem - 1 so re-dropping the
  * same item overwrites its slot instead of accumulating duplicates.
@@ -86,6 +87,13 @@ static void *volatile g_gameobject_klass = NULL;
  * is unambiguously one. Without this, a stale registry entry whose block
  * the GC has reused passes the liveness check and gets called into. */
 static void *volatile g_item_seed_data_klass = NULL;
+
+/* And for ItemRepositionSeed, captured in its Awake hook. g_item_spawn
+ * outlives its object the same way a dropped-item slot does: nothing in the
+ * game roots it, so once the level tears it down the GC is free to hand that
+ * block to something else, whose own non-zero m_CachedPtr then makes the
+ * stale pointer look perfectly alive. */
+static void *volatile g_item_seed_klass = NULL;
 
 
 /* Live ItemSeedData components, maintained by the .ctor/OnDestroy hooks.
@@ -118,6 +126,19 @@ static int g_items_active = 0;
 static unsigned long g_granny_ticks = 0;
 static unsigned long g_item_ticks = 0;
 static unsigned long g_pickray_ticks = 0;
+static unsigned long g_spider_ticks = 0;
+
+/* The live AI_MomSpider, captured from its Update. Cleared the moment it
+ * stops passing the liveness check -- the cellar unloads and this becomes a
+ * pointer to a destroyed object like any other. */
+static void *volatile g_momspider = NULL;
+
+/* Il2CppClass* of AI_MomSpider, captured in its Update where the object is
+ * unambiguously one. Liveness alone can't tell a reused block apart -- the
+ * new occupant has its own non-zero m_CachedPtr -- so without this the
+ * marker would stay pinned at the last cellar position once the level
+ * unloaded and the GC handed that memory to something else. */
+static void *volatile g_momspider_klass = NULL;
 
 /* The ItemRepositionSeed instance, latched at its Awake. It holds the
  * level's 35 item Transforms and persists, unlike ItemSpawn which destroys
@@ -191,23 +212,38 @@ static bool item_seed_data_still_valid(void *component) {
 	return *(void **)component == g_item_seed_data_klass;
 }
 
+/* The latched ItemRepositionSeed's equivalent of gameobject_still_valid().
+ * Without it, a reused block is walked as if it held 35 Transform pointers
+ * and every plausible-looking qword in it gets called into -- which is
+ * exactly how latching ItemSpawn crashed the game on v1.8. */
+static bool item_seed_still_valid(void *instance) {
+	if (!unity_object_alive(instance)) return false;
+	if (!g_item_seed_klass) return true; /* nothing to compare against yet */
+	return *(void **)instance == g_item_seed_klass;
+}
+
 void esp_get_debug_info(esp_debug_info *out) {
 	if (!out) return;
 	esp_lock();
 	out->have_view_projection = g_have_view_projection;
 	out->have_granny_position = g_have_granny_position;
+	out->have_spider_position = g_have_spider_position;
+	out->have_player_position = g_have_player_position;
 	out->item_count = g_item_count;
 	out->items_alive = g_items_alive;
 	out->items_active = g_items_active;
 	out->have_item_spawn = (g_item_spawn != NULL);
 	out->item_spawn = g_item_spawn;
-	out->item_spawn_alive = unity_object_alive(g_item_spawn);
-	out->item_slot0 = g_item_spawn
+	out->item_spawn_alive = item_seed_still_valid(g_item_spawn);
+	/* Only read the slot through a pointer that passed both checks -- on a
+	 * reused block this field is somebody else's data. */
+	out->item_slot0 = out->item_spawn_alive
 	                      ? *(void **)((uintptr_t)g_item_spawn + ITEMSEED_FIRST_ITEM_FIELD)
 	                      : NULL;
 	out->granny_ticks = g_granny_ticks;
 	out->item_ticks = g_item_ticks;
 	out->pickray_ticks = g_pickray_ticks;
+	out->spider_ticks = g_spider_ticks;
 	esp_unlock();
 }
 
@@ -222,7 +258,10 @@ void esp_set_view_projection(const esp_mat4 *vp) {
 	esp_unlock();
 }
 
-bool esp_world_to_screen(esp_vec3 world, float *out_x, float *out_y) {
+/* Shared by the box projection and the arrows. The arrows need the raw clip
+ * coordinates, because "behind the camera" is a case they handle rather than
+ * reject -- so the division and the range checks live in the callers. */
+static bool world_to_clip(esp_vec3 world, float *out_x, float *out_y, float *out_w) {
 	if (!g_have_view_projection) return false;
 
 	const float(*m)[4] = g_view_projection.m;
@@ -232,10 +271,20 @@ bool esp_world_to_screen(esp_vec3 world, float *out_x, float *out_y) {
 	float clip_w = m[3][0] * world.x + m[3][1] * world.y + m[3][2] * world.z + m[3][3];
 
 	/* NaN compares false against everything, so it would slip past every
-	 * range check below and reach ImGui as a garbage vertex -- which blows
-	 * out the draw list's 16-bit index buffer and trips an assert deep
+	 * range check downstream and reach ImGui as a garbage vertex -- which
+	 * blows out the draw list's 16-bit index buffer and trips an assert deep
 	 * inside ImGui rather than here. Reject it explicitly. */
 	if (!isfinite(clip_x) || !isfinite(clip_y) || !isfinite(clip_w)) return false;
+
+	*out_x = clip_x;
+	*out_y = clip_y;
+	*out_w = clip_w;
+	return true;
+}
+
+bool esp_world_to_screen(esp_vec3 world, float *out_x, float *out_y) {
+	float clip_x, clip_y, clip_w;
+	if (!world_to_clip(world, &clip_x, &clip_y, &clip_w)) return false;
 
 	/* Behind the camera (or right on the plane) -- projecting would mirror
 	 * the point to the wrong side of the screen. */
@@ -279,7 +328,8 @@ static ImU32 esp_category_color(int category) {
 
 /* Box + label at a projected world position. Height is in world units and
  * projected separately so the box shrinks with distance on its own. */
-static void draw_entity(esp_vec3 feet, float height, const char *label, ImU32 color) {
+static void draw_entity(esp_vec3 feet, float height, float width_ratio, const char *label,
+                        ImU32 color) {
 	float foot_x, foot_y, head_x, head_y;
 	if (!esp_world_to_screen(feet, &foot_x, &foot_y)) return;
 
@@ -288,7 +338,7 @@ static void draw_entity(esp_vec3 feet, float height, const char *label, ImU32 co
 	if (!esp_world_to_screen(head, &head_x, &head_y)) return;
 
 	float box_height = foot_y - head_y;
-	float box_width = box_height * esp_box_width_ratio;
+	float box_width = box_height * width_ratio;
 
 	ImDrawList *draw = ImGui::GetBackgroundDrawList();
 	ImVec2 top_left(foot_x - box_width * 0.5f, head_y);
@@ -307,6 +357,120 @@ static void draw_entity(esp_vec3 feet, float height, const char *label, ImU32 co
 		draw->AddText(ImVec2(text_pos.x + 1, text_pos.y + 1), IM_COL32(0, 0, 0, 200), label);
 		draw->AddText(text_pos, color, label);
 	}
+}
+
+
+/* Straight-line distance from the player, or -1 when we haven't got a player
+ * position this frame. */
+static float distance_from_player(esp_vec3 world) {
+	if (!g_have_player_position) return -1.0f;
+
+	const float dx = world.x - g_player_position.x;
+	const float dy = world.y - g_player_position.y;
+	const float dz = world.z - g_player_position.z;
+	const float distance = sqrtf(dx * dx + dy * dy + dz * dz);
+	return isfinite(distance) ? distance : -1.0f;
+}
+
+/*
+ * An arrow on the screen edge pointing at something you can't see.
+ *
+ * A box is only useful once the thing is already in front of you. This
+ * covers the rest: off the side of the screen, or behind you.
+ *
+ * Behind the camera is the case that needs care. There, clip w goes
+ * negative and dividing by it mirrors the point through the origin -- an
+ * enemy directly behind and to your left projects to the upper right, which
+ * is why a naive implementation points confidently the wrong way. So the
+ * division is skipped entirely when w is negative and the clip x/y are
+ * negated instead; only the direction matters, not the magnitude, because
+ * the vector is normalised straight afterwards.
+ *
+ * The arrow then sits on an ellipse inset from the screen edge, which keeps
+ * it fully visible in every direction without the corner special-casing a
+ * rectangle would need.
+ */
+static void draw_direction_arrow(esp_vec3 world, ImU32 color, const char *name) {
+	float clip_x, clip_y, clip_w;
+	if (!world_to_clip(world, &clip_x, &clip_y, &clip_w)) return;
+
+	const ImVec2 screen = ImGui::GetIO().DisplaySize;
+	if (!(screen.x > 0.0f) || !(screen.y > 0.0f)) return;
+
+	float ndc_x, ndc_y;
+	if (clip_w > 0.1f) {
+		ndc_x = clip_x / clip_w;
+		ndc_y = clip_y / clip_w;
+		/* On screen already -- the box has it covered, and an arrow pointing
+		 * at something you can see is just clutter. */
+		if (ndc_x >= -1.0f && ndc_x <= 1.0f && ndc_y >= -1.0f && ndc_y <= 1.0f) return;
+	} else if (clip_w >= 0.0f) {
+		/* In front of the camera but too close to divide by. The direction is
+		 * still correct here, only the magnitude blows up -- and the vector is
+		 * normalised below, so the raw clip values do fine. Lumping this in
+		 * with the negation below pointed the arrow directly away from an
+		 * enemy standing on top of you, which is the one moment it matters. */
+		ndc_x = clip_x;
+		ndc_y = clip_y;
+	} else {
+		/* Genuinely behind: a negative w mirrors the point through the origin,
+		 * so the sign has to come back off before the direction means
+		 * anything. */
+		ndc_x = -clip_x;
+		ndc_y = -clip_y;
+	}
+
+	/* Screen y grows downward, clip y grows upward. */
+	float dir_x = ndc_x;
+	float dir_y = -ndc_y;
+	const float length = sqrtf(dir_x * dir_x + dir_y * dir_y);
+	if (!isfinite(length) || length < 1e-4f) return;
+	dir_x /= length;
+	dir_y /= length;
+
+	const float centre_x = screen.x * 0.5f;
+	const float centre_y = screen.y * 0.5f;
+	const float radius_x = centre_x - esp_arrow_margin;
+	const float radius_y = centre_y - esp_arrow_margin;
+	/* A margin wider than the window would put the ring behind the screen
+	 * centre and flip every arrow. */
+	if (radius_x < 16.0f || radius_y < 16.0f) return;
+
+	const float x = centre_x + dir_x * radius_x;
+	const float y = centre_y + dir_y * radius_y;
+	if (!isfinite(x) || !isfinite(y)) return;
+
+	const float size = esp_arrow_size;
+	const float half = size * 0.5f;
+	/* Perpendicular to the heading, for the two base corners. */
+	const float perp_x = -dir_y;
+	const float perp_y = dir_x;
+
+	const ImVec2 tip(x + dir_x * half, y + dir_y * half);
+	const float base_x = x - dir_x * half;
+	const float base_y = y - dir_y * half;
+	const ImVec2 left(base_x + perp_x * half * 0.8f, base_y + perp_y * half * 0.8f);
+	const ImVec2 right(base_x - perp_x * half * 0.8f, base_y - perp_y * half * 0.8f);
+
+	ImDrawList *draw = ImGui::GetBackgroundDrawList();
+	draw->AddTriangleFilled(tip, left, right, color);
+	draw->AddTriangle(tip, left, right, IM_COL32(0, 0, 0, 200), 2.0f);
+
+	/* Label inside the arrow, toward the middle of the screen, so it never
+	 * runs off the edge the arrow is pinned to. */
+	char label[64];
+	const float distance = distance_from_player(world);
+	if (distance >= 0.0f) {
+		wsprintfA(label, "%s %dm", name, (int)(distance + 0.5f));
+	} else {
+		lstrcpynA(label, name, (int)sizeof(label));
+	}
+
+	const ImVec2 text_size = ImGui::CalcTextSize(label);
+	const ImVec2 text_pos(x - dir_x * size - text_size.x * 0.5f,
+	                      y - dir_y * size - text_size.y * 0.5f);
+	draw->AddText(ImVec2(text_pos.x + 1.0f, text_pos.y + 1.0f), IM_COL32(0, 0, 0, 200), label);
+	draw->AddText(text_pos, color, label);
 }
 
 /* Unity stores Matrix4x4 column-major: element (row, col) is raw[col*4+row].
@@ -773,7 +937,12 @@ void esp_collect_items(void *item_seed) {
 	staged_count = collect_seed_data_items(base, g_seed_items, g_seed_item_count, staged,
 	                                        ESP_MAX_ITEMS, seen_objects, &seen_count);
 
-	if (unity_object_alive(item_seed)) {
+	if (!item_seed_still_valid(item_seed)) {
+		/* Stale, or a block the GC has since reused. Drop it rather than
+		 * re-testing it every frame; the next ItemRepositionSeed::Awake
+		 * latches a fresh one. */
+		if (item_seed != NULL && item_seed == g_item_spawn) g_item_spawn = NULL;
+	} else {
 		int limit = esp_item_scan_limit;
 		if (limit < 0) limit = 0;
 		if (limit > ITEMSEED_ITEM_COUNT) limit = ITEMSEED_ITEM_COUNT;
@@ -896,7 +1065,7 @@ void esp_collect_items(void *item_seed) {
 		get_position(&position, transform, NULL);
 
 		staged[staged_count].position = position;
-		staged[staged_count].name = g_dropped_names[i];
+		staged[staged_count].name = spawn_item_name(i);
 		staged[staged_count].owned_name[0] = 0;
 		staged[staged_count].category = 0;
 		staged_count++;
@@ -923,6 +1092,9 @@ static ItemRepositionSeed_Awake_t original_item_seed_awake = NULL;
  * level's actual items and persists, so it's hooked instead. */
 static void __fastcall hooked_item_seed_awake(void *instance) {
 	g_item_ticks++;
+	/* Unambiguously an ItemRepositionSeed right here, so this is where to
+	 * learn its class for the staleness check above. */
+	if (!g_item_seed_klass && instance) g_item_seed_klass = *(void **)instance;
 	g_item_spawn = instance;
 
 	/* New level: every pointer cached from the old one is stale. The
@@ -1008,6 +1180,57 @@ static void __fastcall hooked_item_seed_data_on_destroy(void *instance) {
 	original_item_seed_data_on_destroy(instance);
 }
 
+static AI_MomSpider_Update_t original_momspider_update = NULL;
+
+/* The cellar spider's own driver. Hooked for the same reason as Granny's
+ * FixedUpdate -- it is the only place the live instance reliably appears --
+ * and it simply never fires outside the cellar, so nothing needs to know
+ * which level is loaded. */
+/* Same shape as gameobject_still_valid(), for the same reason. */
+static bool momspider_still_valid(void *instance) {
+	if (!unity_object_alive(instance)) return false;
+	if (!g_momspider_klass) return true; /* nothing to compare against yet */
+	return *(void **)instance == g_momspider_klass;
+}
+
+static void __fastcall hooked_momspider_update(void *instance) {
+	g_spider_ticks++;
+	if (!g_momspider_klass && instance) g_momspider_klass = *(void **)instance;
+	g_momspider = instance;
+
+	if (!esp_momspider_enabled) {
+		/* Only take the lock if there's something to clear. */
+		if (g_have_spider_position) {
+			esp_lock();
+			g_have_spider_position = false;
+			esp_unlock();
+		}
+		original_momspider_update(instance);
+		return;
+	}
+
+	esp_vec3 position;
+	bool have_position = false;
+	uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
+	if (base != 0 && unity_object_alive(instance)) {
+		void *transform =
+		    ((Component_get_transform_t)(base + OFFSET_Component_get_transform))(instance, NULL);
+		if (unity_object_alive(transform)) {
+			((Transform_get_position_t)(base + OFFSET_Transform_get_position))(&position, transform, NULL);
+			have_position = true;
+		}
+	}
+
+	/* Published together so the render thread never sees the flag set against
+	 * a half-written position. */
+	esp_lock();
+	if (have_position) g_spider_position = position;
+	g_have_spider_position = have_position;
+	esp_unlock();
+
+	original_momspider_update(instance);
+}
+
 static PickRay_Update_t original_pickray_update = NULL;
 
 /* The ESP's primary tick. Runs every frame on the main thread for as long
@@ -1020,23 +1243,57 @@ static void __fastcall hooked_pickray_update(void *instance) {
 	/* Main thread, so this is where RenderSettings can safely be touched --
 	 * the checkbox itself is clicked on the present thread. */
 	fullbright_tick(instance);
+	/* Same reason: Instantiate is an IL2CPP call, and the Spawn button that
+	 * queues one is clicked on the present thread. */
+	spawn_tick(instance);
 
-	if (esp_granny_enabled || esp_items_enabled) {
+	/* The cellar unloading doesn't tell us anything -- the spider's Update
+	 * just stops firing, leaving the last position on screen forever. Its
+	 * instance going stale is the signal. */
+	if (g_have_spider_position && !momspider_still_valid(g_momspider)) {
+		esp_lock();
+		g_have_spider_position = false;
+		esp_unlock();
+		g_momspider = NULL;
+	}
+
+	if (esp_granny_enabled || esp_items_enabled || esp_momspider_enabled) {
 		uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
 		if (base != 0) {
 			refresh_camera(base);
+
+			/* PickRay is a component on the player, so its transform is the
+			 * player's -- which is all the distance beside an arrow needs.
+			 * Only paid for when an arrow could actually be drawn. */
+			if (esp_arrows_enabled) {
+				esp_vec3 position;
+				bool have_position = false;
+				void *transform =
+				    ((Component_get_transform_t)(base + OFFSET_Component_get_transform))(instance, NULL);
+				if (unity_object_alive(transform)) {
+					((Transform_get_position_t)(base + OFFSET_Transform_get_position))(
+					    &position, transform, NULL);
+					have_position = true;
+				}
+				esp_lock();
+				if (have_position) g_player_position = position;
+				g_have_player_position = have_position;
+				esp_unlock();
+			}
+
 			if (esp_items_enabled) {
 				esp_collect_items(g_item_spawn);
 			}
 		}
 	}
 
-	/* Compaction can't be left to the collect above: with Item ESP off that
-	 * never runs, dead entries accumulate, and once the array hits its cap
-	 * the .ctor hook silently discards every new item from then on. */
-	if (!esp_items_enabled) {
-		esp_prune_registry();
-	}
+	/* Compaction can't be left to the collect above. It only compacts when
+	 * it is handed the registry itself, which the scene-scan path never does
+	 * -- and with Item ESP off it doesn't run at all. Either way dead entries
+	 * accumulate until the array hits its cap, after which the .ctor hook
+	 * silently discards every new item. Cheap enough to just always do: a
+	 * walk of at most 192 pointers, two loads each. */
+	esp_prune_registry();
 
 	original_pickray_update(instance);
 }
@@ -1087,6 +1344,16 @@ int esp_install_hooks(void) {
 		OutputDebugStringA("[cheat] MH_CreateHook(ItemSeedData::OnDestroy) failed");
 	}
 
+	/* Not fatal if it fails: the cellar spider is one level's enemy, and
+	 * losing its box shouldn't cost you the rest of the ESP. */
+	void *spider_target = (void *)(base + OFFSET_AI_MomSpider_Update);
+	if (MH_CreateHook(spider_target, (void *)&hooked_momspider_update,
+	                  (void **)&original_momspider_update) == MH_OK) {
+		MH_EnableHook(spider_target);
+	} else {
+		OutputDebugStringA("[cheat] MH_CreateHook(AI_MomSpider::Update) failed");
+	}
+
 	void *pickray_target = (void *)(base + OFFSET_PickRay_Update);
 	if (MH_CreateHook(pickray_target, (void *)&hooked_pickray_update,
 	                  (void **)&original_pickray_update) != MH_OK) {
@@ -1103,7 +1370,7 @@ int esp_install_hooks(void) {
 }
 
 void esp_render(void) {
-	if (!esp_granny_enabled && !esp_items_enabled) return;
+	if (!esp_granny_enabled && !esp_items_enabled && !esp_momspider_enabled) return;
 
 	/* Held across the whole draw so the collected data can't be rewritten
 	 * from the game thread midway through reading it. The collector only
@@ -1123,7 +1390,17 @@ void esp_render(void) {
 
 	if (esp_granny_enabled && g_have_granny_position) {
 		/* Her transform sits at her feet, so the box grows upward. */
-		draw_entity(g_granny_position, esp_box_height, "Granny", IM_COL32(255, 64, 64, 255));
+		const ImU32 granny_color = IM_COL32(255, 64, 64, 255);
+		draw_entity(g_granny_position, esp_box_height, esp_box_width_ratio, "Granny", granny_color);
+		/* No-op while she's on screen -- see draw_direction_arrow(). */
+		if (esp_arrows_enabled) draw_direction_arrow(g_granny_position, granny_color, "Granny");
+	}
+
+	if (esp_momspider_enabled && g_have_spider_position) {
+		const ImU32 spider_color = IM_COL32(200, 120, 255, 255);
+		draw_entity(g_spider_position, esp_spider_box_height, esp_spider_box_width_ratio,
+		            "Mom Spider", spider_color);
+		if (esp_arrows_enabled) draw_direction_arrow(g_spider_position, spider_color, "Mom Spider");
 	}
 
 	if (esp_items_enabled) {

@@ -25,6 +25,21 @@ extern "C" {
 int d3d11_hook_install(void);
 
 /**
+ * @brief Whether the overlay currently owns the keyboard.
+ *
+ * True while a menu text field has focus -- Ctrl+clicking a slider, or
+ * rebinding a key. Anything that reads the keyboard directly rather than
+ * through the window proc (noclip's rise and descend) has to check this, or
+ * the characters being typed also drive the game.
+ *
+ * Safe from any thread: it reads a plain flag the overlay refreshes once a
+ * frame, not ImGui state.
+ *
+ * @return Nonzero while the menu is capturing typing.
+ */
+int overlay_wants_keyboard(void);
+
+/**
  * @brief Disable the Present hook and uninitialize MinHook.
  *
  * Only call this once nothing else in the process is relying on MinHook

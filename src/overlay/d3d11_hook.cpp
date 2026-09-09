@@ -3,6 +3,11 @@
 #include "game/fullbright.h"
 #include "game/granny_ai.h"
 #include "game/offsets.h"
+#include "game/player.h"
+#include "game/traps.h"
+#include "game/spawn.h"
+#include "core/keybinds.h"
+#include "core/config.h"
 #include "overlay/esp.h"
 #include "MinHook.h"
 
@@ -47,33 +52,15 @@ static bool g_menu_visible = false;
 static CRITICAL_SECTION g_imgui_lock;
 static bool g_imgui_lock_ready = false;
 
-/* Implemented.
- *
- * "Immortality" rather than something Granny-specific: the byte patch lands
- * on PlayerStatus::NormalDeath and ::KnockDeath, which are the game's
- * generic death paths, not hers. Confirmed in game by surviving the
- * third-floor fake-floor trap, which kills by fall damage with Granny
- * nowhere near. The two catch hooks it also toggles are hers, but the death
- * patch is what does the heavy lifting. */
-bool immortality = false;
-
-/* Set when Stop granny is clicked with no live instance, so the menu can
- * say why nothing happened instead of appearing to ignore the click. */
 static bool g_stop_granny_failed = false;
 
-/* WIP -- these are UI placeholders only. Nothing is wired up behind them
- * yet, so they render greyed out via wip_checkbox()/wip_slider() below.
- * Drop the wip_ prefix and move them up to the block above as each one
- * gets an actual implementation. */
-static bool wip_noclip = false;
-static bool wip_infinite_jump = false;
-static float wip_player_speed = 1.0f;
+/* Read from the game thread; see overlay_wants_keyboard(). A lone bool, and
+ * a frame of staleness either way costs nothing. */
+static volatile bool g_overlay_wants_keyboard = false;
 
-static bool wip_granny_deaf = false;
-static bool wip_freeze_in_place = false;
-
-static bool wip_disable_traps = false;
-
+extern "C" int overlay_wants_keyboard(void) {
+    return g_overlay_wants_keyboard ? 1 : 0;
+}
 
 static void create_render_target(IDXGISwapChain *swap_chain) {
     ID3D11Texture2D *back_buffer = nullptr;
@@ -180,53 +167,47 @@ static void init_imgui(IDXGISwapChain *swap_chain) {
     OutputDebugStringA("[cheat] ImGui initialized (Insert to toggle menu)");
 }
 
-/* Greyed-out widgets for features that have UI but no implementation yet.
- * Disabled rather than hidden so the roadmap is visible in-game. */
-static void wip_checkbox(const char *label, bool *value) {
-	ImGui::BeginDisabled();
-	ImGui::Checkbox(label, value);
-	ImGui::EndDisabled();
-	if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-		ImGui::SetTooltip("Not implemented yet");
-	}
-}
-
-static void wip_slider(const char *label, float *value, float min, float max) {
-	ImGui::BeginDisabled();
-	ImGui::SliderFloat(label, value, min, max, "%.2fx");
-	ImGui::EndDisabled();
-	if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-		ImGui::SetTooltip("Not implemented yet");
-	}
-}
+/*
+ * The toggles whose side effects are more than a bool -- Immortality's hook
+ * state and death patch, the trap patches -- live with the code they touch
+ * (granny_apply_immortality, traps_apply). Both read a flag that has already
+ * been flipped and make the game agree with it, so a keybind, a checkbox and
+ * a loaded config all take the same path instead of three copies that drift.
+ */
 
 static void draw_player_tab() {
 	if (ImGui::Checkbox("Immortality", &immortality)) {
-		uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
-
-		/* The two catch paths stay detours -- they substitute real behaviour
-		 * (ResetAIDecision) rather than just suppressing the original. */
-		if (immortality) {
-			MH_EnableHook(reinterpret_cast<LPVOID>(base + OFFSET_PlayerStatus_GrannyCaughtYou));
-			MH_EnableHook(reinterpret_cast<LPVOID>(base + OFFSET_PlayerStatus_GrannyCaughtYouBed));
-		} else {
-			MH_DisableHook(reinterpret_cast<LPVOID>(base + OFFSET_PlayerStatus_GrannyCaughtYou));
-			MH_DisableHook(reinterpret_cast<LPVOID>(base + OFFSET_PlayerStatus_GrannyCaughtYouBed));
-		}
-
-		/* The two death paths are pure suppression, so they're byte patched
-		 * instead of hooked -- no trampoline, two fewer hooks. */
-		if (!granny_set_death_disabled(immortality)) {
-			OutputDebugStringA("[cheat] death patch failed, reverting toggle");
-			immortality = !immortality;
-		}
+		granny_apply_immortality();
 	}
 
 	ImGui::Separator();
-	ImGui::TextDisabled("Planned");
-	wip_checkbox("Infinite jump", &wip_infinite_jump);
-	wip_checkbox("Noclip", &wip_noclip);
-	wip_slider("Move speed", &wip_player_speed, 0.5f, 5.0f);
+
+	/* Both of these are applied on the game thread by player_tick(); the
+	 * widgets only set flags. */
+	ImGui::Checkbox("Noclip", &player_noclip_enabled);
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip("Walk through walls. Space rises, Ctrl descends.\n"
+		                  "Switching it off while inside geometry can wedge you.");
+	}
+
+	ImGui::Checkbox("No hard landing", &player_no_hard_landing);
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip("Drop from any height and keep walking.\n"
+		                  "Removes the stagger and the get-up animation.\n"
+		                  "Fatal falls stop being fatal too -- same counter.");
+	}
+
+	bool speed_changed = ImGui::Checkbox("Override move speed", &player_speed_enabled);
+	ImGui::BeginDisabled(!player_speed_enabled);
+	/* A multiplier rather than an absolute speed: the game keeps a separate
+	 * standing and crouched speed, and scaling both preserves the difference
+	 * instead of flattening them to one number. */
+	speed_changed |= ImGui::SliderFloat("Move speed", &player_speed_multiplier, 0.1f, 10.0f, "%.2fx");
+	ImGui::EndDisabled();
+	if (speed_changed) player_mark_dirty();
+	if (player_speed_enabled) {
+		ImGui::TextDisabled("Unchecking restores the game's own speeds.");
+	}
 }
 
 static void draw_granny_tab() {
@@ -281,14 +262,115 @@ static void draw_granny_tab() {
 	}
 
 	ImGui::Separator();
-	ImGui::TextDisabled("Planned");
-	wip_checkbox("Freeze in place", &wip_freeze_in_place);
-	wip_checkbox("Deaf (ignore sound)", &wip_granny_deaf);
+
+	/* Freeze shares the speed override's saved originals, so it has to raise
+	 * the same dirty flag -- without it, unchecking freeze would never reach
+	 * the restore branch and she'd stay pinned at zero. */
+	if (ImGui::Checkbox("Freeze in place", &granny_freeze_enabled)) {
+		granny_speed_mark_dirty();
+	}
+	if (granny_freeze_enabled) {
+		ImGui::TextDisabled("Overrides the speed sliders while it's on.");
+	}
+
+	/* Re-applied every FixedUpdate tick like Blind -- the game keeps handing
+	 * her fresh noises, so a single write wouldn't hold. */
+	ImGui::Checkbox("Deaf (ignore sound)", &granny_is_deaf);
 }
 
 static void draw_world_tab() {
-	ImGui::TextDisabled("Planned");
-	wip_checkbox("Disable traps", &wip_disable_traps);
+	/* Writes to code pages, never into IL2CPP, so it's safe straight from
+	 * this thread -- unlike the spawn below. */
+	if (ImGui::Checkbox("Disable traps", &traps_disabled)) {
+		traps_apply();
+	}
+	ImGui::TextDisabled("Bear traps, poison, explosives and the generic trigger.");
+	ImGui::TextDisabled("The traps stay visible -- they just stop firing.");
+
+	ImGui::Separator();
+	ImGui::TextDisabled("Spawn item");
+
+	/* The list is ItemSpawn's own 55 slots, in its dispatch order, so what
+	 * you pick here is exactly what CountItem selects. */
+	if (ImGui::BeginCombo("Item", spawn_item_name(spawn_selected_index))) {
+		for (int i = 0; i < spawn_item_count(); i++) {
+			const bool selected = (i == spawn_selected_index);
+			if (ImGui::Selectable(spawn_item_name(i), selected)) spawn_selected_index = i;
+			if (selected) ImGui::SetItemDefaultFocus();
+		}
+		ImGui::EndCombo();
+	}
+
+	/* Only queues the request -- Instantiate is an IL2CPP call, so the work
+	 * happens on the next PickRay tick. */
+	if (ImGui::Button("Spawn")) {
+		spawn_request_item(spawn_selected_index);
+	}
+	ImGui::SameLine();
+	ImGui::TextDisabled("Lands at your drop point, same as dropping it.");
+
+	/* Paced one per tick rather than 55 at once -- see spawn_request_all().
+	 * While it runs the button turns into a cancel, since a mistaken click
+	 * otherwise buries you before you can do anything about it. */
+	if (spawn_bulk_active()) {
+		char label[64];
+		wsprintfA(label, "Stop (%d left)", spawn_bulk_remaining());
+		if (ImGui::Button(label)) spawn_cancel_all();
+	} else if (ImGui::Button("Spawn every item")) {
+		spawn_request_all();
+	}
+	ImGui::SameLine();
+	ImGui::TextDisabled("All 55, dropped over about a second.");
+
+	if (spawn_last_failed()) {
+		ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.35f, 1.0f),
+		                   "Last spawn failed -- is a level loaded?");
+	}
+}
+
+/* Rebindable actions. The bindings themselves live in keybinds.c; this is
+ * just the editor for them. */
+static void draw_keybinds_tab() {
+	ImGui::TextDisabled("Click a key to rebind it.");
+	ImGui::TextDisabled("Esc cancels, Backspace or Delete clears.");
+	ImGui::Separator();
+
+	if (ImGui::BeginTable("keybinds", 2,
+	                      ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+		for (int i = 0; i < KEYBIND_COUNT; i++) {
+			const keybind_id id = static_cast<keybind_id>(i);
+
+			ImGui::TableNextRow();
+			ImGui::TableNextColumn();
+			ImGui::TextUnformatted(keybind_name(id));
+
+			ImGui::TableNextColumn();
+			/* The ##i suffix keeps two actions bound to the same key from
+			 * colliding in ImGui's ID stack. */
+			char label[96];
+			if (keybind_capturing() == id) {
+				wsprintfA(label, "press a key...##kb%d", i);
+			} else {
+				char key[32];
+				keybind_key_name(keybind_keys[i], key, sizeof(key));
+				wsprintfA(label, "%s##kb%d", key, i);
+			}
+
+			if (ImGui::Button(label, ImVec2(-1.0f, 0.0f))) {
+				if (keybind_capturing() == id) {
+					keybind_cancel_capture();
+				} else {
+					keybind_begin_capture(id);
+				}
+			}
+		}
+		ImGui::EndTable();
+	}
+
+	ImGui::Separator();
+	ImGui::TextDisabled("Defaults avoid the letter keys -- Granny uses most of");
+	ImGui::TextDisabled("them, and a cheat key that also drops your item is");
+	ImGui::TextDisabled("worse than no cheat key.");
 }
 
 static void draw_visuals_tab() {
@@ -297,6 +379,27 @@ static void draw_visuals_tab() {
 	 * status line saying so, rather than nothing at all. */
 	ImGui::Checkbox("Granny ESP", &esp_granny_enabled);
 	ImGui::Checkbox("Item ESP", &esp_items_enabled);
+
+	/* The cellar's AI_MomSpider -- a different class from the attic spider
+	 * that stings you, and the only other thing in the game that hunts. */
+	ImGui::Checkbox("Mom Spider ESP", &esp_momspider_enabled);
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip("The big spider in the cellar.\n"
+		                  "Nothing to show anywhere else in the house.");
+	}
+
+	ImGui::Checkbox("Off-screen arrows", &esp_arrows_enabled);
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip("Points at whichever enemies are switched on above,\n"
+		                  "while they're off the screen or behind you.\n"
+		                  "Distance in metres beside each arrow.");
+	}
+	if (esp_arrows_enabled) {
+		ImGui::Indent();
+		ImGui::SliderFloat("Arrow size", &esp_arrow_size, 10.0f, 60.0f, "%.0f px");
+		ImGui::SliderFloat("Arrow inset", &esp_arrow_margin, 20.0f, 200.0f, "%.0f px");
+		ImGui::Unindent();
+	}
 
 	/* Categories are the game's own, straight off ItemSeedData::category. */
 	ImGui::Indent();
@@ -311,6 +414,11 @@ static void draw_visuals_tab() {
 	 * cheaply, so tune the box by eye instead of rebuilding to guess. */
 	ImGui::SliderFloat("Box height", &esp_box_height, 0.5f, 5.0f, "%.2f");
 	ImGui::SliderFloat("Box width", &esp_box_width_ratio, 0.1f, 1.5f, "%.2f");
+
+	/* Separate from Granny's: the spider is low and wide where she is tall
+	 * and narrow, so one pair of numbers can't flatter both. */
+	ImGui::SliderFloat("Spider height", &esp_spider_box_height, 0.3f, 4.0f, "%.2f");
+	ImGui::SliderFloat("Spider width", &esp_spider_box_width_ratio, 0.2f, 3.0f, "%.2f");
 
 	ImGui::SliderInt("Items: scan limit", &esp_item_scan_limit, 0, 35);
 	ImGui::Checkbox("Items: log each slot", &esp_items_verbose);
@@ -364,9 +472,12 @@ static void draw_debug_tab() {
 	ImGui::Separator();
 	ImGui::Text("FixedUpdate hook   %lu ticks", esp.granny_ticks);
 	ImGui::Text("PickRay hook       %lu ticks", esp.pickray_ticks);
+	ImGui::Text("MomSpider hook     %lu ticks", esp.spider_ticks);
 	ImGui::Text("ItemSeed Awake     %lu ticks", esp.item_ticks);
 	ImGui::Text("camera matrix      %s", esp.have_view_projection ? "ok" : "MISSING");
 	ImGui::Text("granny position    %s", esp.have_granny_position ? "ok" : "MISSING");
+	ImGui::Text("spider position    %s", esp.have_spider_position ? "ok" : "MISSING");
+	ImGui::Text("player position    %s", esp.have_player_position ? "ok" : "MISSING");
 	ImGui::Text("ItemSeed instance  %s  0x%llX",
 	            !esp.have_item_spawn ? "MISSING" : (esp.item_spawn_alive ? "alive" : "DEAD"),
 	            (unsigned long long)(uintptr_t)esp.item_spawn);
@@ -408,12 +519,32 @@ static void draw_menu() {
 			draw_visuals_tab();
 			ImGui::EndTabItem();
 		}
+		if (ImGui::BeginTabItem("Keybinds")) {
+			draw_keybinds_tab();
+			ImGui::EndTabItem();
+		}
 		if (ImGui::BeginTabItem("Debug")) {
 			draw_debug_tab();
 			ImGui::EndTabItem();
 		}
 		ImGui::EndTabBar();
 	}
+
+	/* Below the tabs rather than inside one: the config covers everything in
+	 * the window, so burying it in a tab would make it look like it only
+	 * applied to that tab's settings. */
+	ImGui::Separator();
+	if (ImGui::Button("Save config")) {
+		config_save();
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Reload config")) {
+		config_load();
+		config_apply();
+	}
+	ImGui::SameLine();
+	ImGui::TextDisabled("%s", config_status());
+	ImGui::TextDisabled("Loads by itself on injection. %s", config_path());
 
 	ImGui::End();
 }
@@ -441,20 +572,99 @@ static void render_frame() {
     LeaveCriticalSection(&g_imgui_lock);
 }
 
+/*
+ * Polls the bindings once per frame and acts on whatever went down.
+ *
+ * Each case flips the same flag the matching checkbox does and then runs the
+ * same apply function, so a key and a click are indistinguishable to the
+ * rest of the cheat. The ones that need the game thread (a speed change, a
+ * spawn) only raise their flag here, exactly as the widgets do.
+ */
+static void handle_keybinds() {
+    ImGuiIO &io = ImGui::GetIO();
+
+    /* Ctrl+clicking a slider turns it into a text box, and the digits you
+     * type there must not also fire cheats. */
+    const bool typing = io.WantTextInput || keybind_capturing() != KEYBIND_COUNT;
+    keybinds_update(!typing);
+
+    /* Published as a plain flag so noclip's rise and descend -- read off the
+     * keyboard on the game thread, bypassing the window proc -- can stay out
+     * of the way while you're typing, without touching ImGui from there. */
+    g_overlay_wants_keyboard = typing;
+
+    if (keybind_pressed(KEYBIND_MENU)) {
+        g_menu_visible = !g_menu_visible;
+        io.MouseDrawCursor = g_menu_visible;
+    }
+
+    if (keybind_pressed(KEYBIND_GRANNY_ESP)) esp_granny_enabled = !esp_granny_enabled;
+    if (keybind_pressed(KEYBIND_ITEM_ESP))   esp_items_enabled = !esp_items_enabled;
+    if (keybind_pressed(KEYBIND_MOMSPIDER_ESP)) esp_momspider_enabled = !esp_momspider_enabled;
+    if (keybind_pressed(KEYBIND_ARROWS))     esp_arrows_enabled = !esp_arrows_enabled;
+    if (keybind_pressed(KEYBIND_FULLBRIGHT)) fullbright_enabled = !fullbright_enabled;
+    if (keybind_pressed(KEYBIND_BLIND))      granny_is_blind = !granny_is_blind;
+    if (keybind_pressed(KEYBIND_DEAF))       granny_is_deaf = !granny_is_deaf;
+    if (keybind_pressed(KEYBIND_NOCLIP))     player_noclip_enabled = !player_noclip_enabled;
+
+    if (keybind_pressed(KEYBIND_IMMORTALITY)) {
+        immortality = !immortality;
+        granny_apply_immortality();
+    }
+    if (keybind_pressed(KEYBIND_DISABLE_TRAPS)) {
+        traps_disabled = !traps_disabled;
+        traps_apply();
+    }
+
+    if (keybind_pressed(KEYBIND_MOVE_SPEED)) {
+        player_speed_enabled = !player_speed_enabled;
+        player_mark_dirty();
+    }
+    if (keybind_pressed(KEYBIND_GRANNY_SPEED)) {
+        granny_speed_enabled = !granny_speed_enabled;
+        granny_speed_mark_dirty();
+    }
+    /* Freeze shares the speed override's saved originals, so it raises the
+     * same dirty flag -- see the checkbox in the Granny tab. */
+    if (keybind_pressed(KEYBIND_FREEZE)) {
+        granny_freeze_enabled = !granny_freeze_enabled;
+        granny_speed_mark_dirty();
+    }
+
+    /* The two one-shots. Stop granny is irreversible, so it reports failure
+     * through the same flag the button uses. */
+    if (keybind_pressed(KEYBIND_STOP_GRANNY)) {
+        g_stop_granny_failed = !granny_stop_ai();
+    }
+    if (keybind_pressed(KEYBIND_SPAWN_ITEM)) {
+        spawn_request_item(spawn_selected_index);
+    }
+    if (keybind_pressed(KEYBIND_SPAWN_ALL)) {
+        /* Same button semantics: pressing it again while it runs stops it. */
+        if (spawn_bulk_active()) {
+            spawn_cancel_all();
+        } else {
+            spawn_request_all();
+        }
+    }
+}
+
 static HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swap_chain, UINT sync_interval, UINT flags) {
     if (!g_imgui_initialized) {
         init_imgui(swap_chain);
     }
 
-    /* Insert toggles the menu; rising-edge check so holding the key down
-     * doesn't flicker it open/closed every frame. */
-    static bool insert_was_down = false;
-    bool insert_is_down = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
-    if (insert_is_down && !insert_was_down) {
-        g_menu_visible = !g_menu_visible;
-        ImGui::GetIO().MouseDrawCursor = g_menu_visible;
+    /* Every path below this point touches ImGui's global context or the
+     * device context, and init_imgui has two early returns that leave both
+     * unset (a failed GetDevice or GetImmediateContext, e.g. after a device
+     * reset). Without this guard the next Insert press dereferences a NULL
+     * GImGui, and render_frame() then calls OMSetRenderTargets on a nullptr
+     * context. Bail and let the next Present retry the init instead. */
+    if (!g_imgui_initialized) {
+        return original_present(swap_chain, sync_interval, flags);
     }
-    insert_was_down = insert_is_down;
+
+    handle_keybinds();
 
     /* Skip the whole ImGui frame when there's nothing to show at all. */
     if (g_menu_visible || esp_granny_enabled || esp_items_enabled) {

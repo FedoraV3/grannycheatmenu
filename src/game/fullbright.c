@@ -32,12 +32,24 @@ void fullbright_tick(void *player) {
 	uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
 	if (base == 0) return;
 
-	/* A different PickRay means the game rebuilt the scene -- a restart, or
-	 * a new game -- which resets RenderSettings along with it. Anything we
-	 * saved belonged to the old scene, so drop it and treat this as fresh. */
+	/* A different PickRay usually means the game rebuilt the scene -- a
+	 * restart, or a new game -- which resets RenderSettings along with it.
+	 *
+	 * "Different" alone isn't enough though: an overlapping scene load has
+	 * the outgoing and incoming players both alive for a stretch of frames,
+	 * so Update fires for two instances alternately and every tick looks
+	 * like a rebuild. That re-ran the whole override plus both getters every
+	 * frame and spammed the debug log with it. What actually distinguishes a
+	 * rebuild is that the previous player is *gone*, so check that instead:
+	 * with two live PickRays the old one still has its m_CachedPtr and no
+	 * reset happens. */
 	if (player != NULL && player != g_scene_player) {
+		bool previous_gone =
+		    g_scene_player == NULL ||
+		    *(void **)((uintptr_t)g_scene_player + FIELD_UnityObject_m_CachedPtr) == NULL;
+
 		g_scene_player = player;
-		g_applied = false;
+		if (previous_gone) g_applied = false;
 	}
 
 	if (fullbright_enabled) {

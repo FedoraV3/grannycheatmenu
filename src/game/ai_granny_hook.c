@@ -14,8 +14,8 @@ static void *volatile g_granny_instance = NULL;
 static uintptr_t g_gameassembly_base = 0;
 
 /*
- * NormalDeath and KnockDeath are disabled by byte patch rather than by a
- * MinHook detour. Both were pure no-op detours -- they existed only to stop
+ * NormalDeath, KnockDeath and PlayerGettingStopped are disabled by byte
+ * patch rather than by a MinHook detour. Both were pure no-op detours -- they existed only to stop
  * the original running -- so writing `ret` over the entry point does the
  * same job without a trampoline, and saves two hooks.
  *
@@ -30,14 +30,37 @@ static uintptr_t g_gameassembly_base = 0;
 #define DEATH_PATCH_SIZE 1
 static const uint8_t g_ret_patch[DEATH_PATCH_SIZE] = { 0xC3 };
 
-static uint8_t g_normal_death_original[DEATH_PATCH_SIZE];
-static uint8_t g_knock_death_original[DEATH_PATCH_SIZE];
+/*
+ * PlayerGettingStopped joins the two deaths rather than being handled
+ * separately, because on its own a suppressed death is worse than no cheat:
+ * the kill sequences take control away first and only get it back from the
+ * death that follows. Patch the death alone and the spider leaves you
+ * standing still with a locked camera forever. All three of its callers are
+ * kill paths, so there is nothing else it would break.
+ */
+static struct {
+	const char *name;
+	uintptr_t rva;
+	uint8_t original[DEATH_PATCH_SIZE];
+} g_death_patches[] = {
+	{ "NormalDeath",          OFFSET_PlayerStatus_NormalDeath,         { 0 } },
+	{ "KnockDeath",           OFFSET_PlayerStatus_KnockDeath,          { 0 } },
+	{ "PlayerGettingStopped", OFFSET_PlayerStatus_PlayerGettingStopped, { 0 } },
+};
+
+#define DEATH_PATCH_COUNT ((int)(sizeof(g_death_patches) / sizeof(g_death_patches[0])))
+
 static bool g_death_patched = false;
 
 /* Bound to the "Blind" checkbox in the Granny tab. Applied every tick in
  * hooked_fixed_update rather than once on toggle, because BlindTimer means
  * the game clears IsBlind on its own. */
+bool immortality = false;
 bool granny_is_blind = false;
+
+/* Bound to the "Deaf" checkbox. Applied here for the same reason blind is:
+ * the game keeps handing her fresh noises, so it has to be re-cleared. */
+bool granny_is_deaf = false;
 
 static void __fastcall hooked_fixed_update(void *instance) {
     g_granny_instance = instance;
@@ -59,6 +82,24 @@ static void __fastcall hooked_fixed_update(void *instance) {
 	 * the toggle off, BlindTimer just runs down naturally. */
 	if (granny_is_blind && instance != NULL) {
 		*(volatile bool *)((uintptr_t)instance + FIELD_AI_Granny_IsBlind) = true;
+	}
+
+	/* Deafness, synthesised -- the class has no IsDeaf flag to match IsBlind.
+	 *
+	 * Cleared before the original runs, so FixedUpdate finds no noise to act
+	 * on this tick rather than being interrupted midway through reacting to
+	 * one. NoiseObj is a managed reference, and writing NULL over one needs
+	 * no GC write barrier, so this is a plain store like the rest.
+	 *
+	 * Like blind, this only writes while the toggle is ON: forcing the
+	 * fields to false otherwise would fight the game's own noise handling
+	 * every tick for no reason. */
+	if (granny_is_deaf && instance != NULL) {
+		*(volatile bool *)((uintptr_t)instance + FIELD_AI_Granny_IsFollowingSound) = false;
+		*(void *volatile *)((uintptr_t)instance + FIELD_AI_Granny_NoiseObj) = NULL;
+		/* Without this she still creeps toward the last noise's position for
+		 * as long as the timer has left to run. */
+		*(volatile float *)((uintptr_t)instance + FIELD_AI_Granny_TimerNearNoise) = 0.0f;
 	}
 
 	/* Writes only when she's been rebuilt or a control changed -- see
@@ -119,7 +160,12 @@ int ai_granny_hook_install(void) {
 	
 	if (MH_CreateHook((LPVOID)(base + OFFSET_PlayerStatus_GrannyCaughtYouBed), (void *)&granny_caught_you_bed,
 					  (void **)&original_granny_caught_you_bed) != MH_OK) {
-		OutputDebugStringA("[cheat] MH_CreateHook(PlayerStatus::GrannyCaughtYouBed failed");
+		/* Reported like its two siblings rather than swallowed. Falling
+		 * through here used to make install claim success while the bed
+		 * catch stayed unhooked, so Immortality would show as on and Granny
+		 * would still kill the player under a bed. */
+		OutputDebugStringA("[cheat] MH_CreateHook(PlayerStatus::GrannyCaughtYouBed) failed");
+		return 0;
 	}
 	
 	/* NormalDeath and KnockDeath deliberately get no hook -- they're byte
@@ -170,33 +216,79 @@ bool granny_is_stopped(void) {
 	return true;
 }
 
+bool granny_apply_immortality(void) {
+	if (g_gameassembly_base == 0) return false;
+
+	/* The two catch paths stay detours -- they substitute real behaviour
+	 * (ResetAIDecision) rather than just suppressing the original, so they
+	 * can't be byte patched like the deaths below. */
+	uintptr_t caught = g_gameassembly_base + OFFSET_PlayerStatus_GrannyCaughtYou;
+	uintptr_t caught_bed = g_gameassembly_base + OFFSET_PlayerStatus_GrannyCaughtYouBed;
+	if (immortality) {
+		MH_EnableHook((LPVOID)caught);
+		MH_EnableHook((LPVOID)caught_bed);
+	} else {
+		MH_DisableHook((LPVOID)caught);
+		MH_DisableHook((LPVOID)caught_bed);
+	}
+
+	if (granny_set_death_disabled(immortality)) return true;
+
+	OutputDebugStringA("[cheat] death patch failed, reverting toggle");
+	immortality = !immortality;
+	return false;
+}
+
 bool granny_set_death_disabled(bool disabled) {
 	if (g_gameassembly_base == 0) return false;
 	/* Idempotent: patching twice would save the `ret` as the "original"
 	 * byte and make the restore permanent. */
 	if (disabled == g_death_patched) return true;
 
-	uintptr_t normal_death = g_gameassembly_base + OFFSET_PlayerStatus_NormalDeath;
-	uintptr_t knock_death = g_gameassembly_base + OFFSET_PlayerStatus_KnockDeath;
-
 	if (disabled) {
-		if (!patch_bytes_local(normal_death, g_ret_patch, DEATH_PATCH_SIZE, g_normal_death_original)) {
-			OutputDebugStringA("[cheat] failed to patch PlayerStatus::NormalDeath");
-			return false;
-		}
-		if (!patch_bytes_local(knock_death, g_ret_patch, DEATH_PATCH_SIZE, g_knock_death_original)) {
-			OutputDebugStringA("[cheat] failed to patch PlayerStatus::KnockDeath");
-			/* Don't leave one of the pair patched. */
-			restore_bytes_local(normal_death, g_normal_death_original, DEATH_PATCH_SIZE);
+		for (int i = 0; i < DEATH_PATCH_COUNT; i++) {
+			if (patch_bytes_local(g_gameassembly_base + g_death_patches[i].rva, g_ret_patch,
+			                      DEATH_PATCH_SIZE, g_death_patches[i].original)) {
+				continue;
+			}
+
+			char line[96];
+			wsprintfA(line, "[cheat] failed to patch PlayerStatus::%s", g_death_patches[i].name);
+			OutputDebugStringA(line);
+
+			/* All or nothing. Half of this applied is the worst state to be
+			 * in: PlayerGettingStopped patched without the deaths means you
+			 * still die, and the deaths without it means you freeze. */
+			for (int j = 0; j < i; j++) {
+				restore_bytes_local(g_gameassembly_base + g_death_patches[j].rva,
+				                    g_death_patches[j].original, DEATH_PATCH_SIZE);
+			}
 			return false;
 		}
 		g_death_patched = true;
-		OutputDebugStringA("[cheat] NormalDeath/KnockDeath patched to ret");
-	} else {
-		restore_bytes_local(normal_death, g_normal_death_original, DEATH_PATCH_SIZE);
-		restore_bytes_local(knock_death, g_knock_death_original, DEATH_PATCH_SIZE);
-		g_death_patched = false;
-		OutputDebugStringA("[cheat] NormalDeath/KnockDeath restored");
+		OutputDebugStringA("[cheat] death and jumpscare-stop paths patched to ret");
+		return true;
 	}
+
+	/* The saved bytes are the only surviving copy of those opcodes, so a
+	 * failed restore must NOT clear the flag. Clearing it would let the next
+	 * enable re-run patch_bytes_local, which would dutifully save the 0xC3
+	 * still sitting there as the "original" -- after that every restore
+	 * writes 0xC3 back and death stays suppressed for the rest of the
+	 * session, with the menu reporting it as off. */
+	bool restored = true;
+	for (int i = 0; i < DEATH_PATCH_COUNT; i++) {
+		if (!restore_bytes_local(g_gameassembly_base + g_death_patches[i].rva,
+		                         g_death_patches[i].original, DEATH_PATCH_SIZE)) {
+			restored = false;
+		}
+	}
+	if (!restored) {
+		OutputDebugStringA("[cheat] failed to restore the death patch, leaving it applied");
+		return false;
+	}
+
+	g_death_patched = false;
+	OutputDebugStringA("[cheat] death and jumpscare-stop paths restored");
 	return true;
 }

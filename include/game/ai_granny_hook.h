@@ -6,7 +6,44 @@ extern "C" {
 
 #include <stdbool.h>
 
+/**
+ * Bound to the Player tab's "Immortality" checkbox.
+ *
+ * Named for what it does rather than for Granny: the byte patch lands on
+ * PlayerStatus::NormalDeath and ::KnockDeath, which are the game's generic
+ * death paths. Confirmed in game by surviving the third-floor fake-floor
+ * trap, which kills by fall damage with Granny nowhere near.
+ *
+ * Lives here rather than in the menu so the config can save it and
+ * granny_apply_immortality() can be re-run on load.
+ */
+extern bool immortality;
+
+/**
+ * @brief Push `immortality` into the game.
+ *
+ * Enables or disables the two catch detours and applies or lifts the death
+ * byte patch. Reverts the flag if the patch fails, so the menu never shows a
+ * state the game isn't in.
+ *
+ * Must not run before ai_granny_hook_install() has created the hooks.
+ *
+ * @return true if the game is now in the requested state.
+ */
+bool granny_apply_immortality(void);
+
 extern bool granny_is_blind;
+
+/**
+ * Bound to the Granny tab's "Deaf" checkbox.
+ *
+ * There is no IsDeaf flag to pair with IsBlind, so deafness is synthesised:
+ * every tick the hook clears the two fields that carry a heard noise
+ * (IsFollowingSound and NoiseObj) plus the proximity timer, before her
+ * FixedUpdate gets a chance to act on them. She still gets given noises by
+ * the game's trigger volumes -- she just never has one to walk towards.
+ */
+extern bool granny_is_deaf;
 
 /**
  * @brief Disable or restore PlayerStatus::NormalDeath and ::KnockDeath by

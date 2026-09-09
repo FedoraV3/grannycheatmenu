@@ -52,6 +52,26 @@ static const uintptr_t OFFSET_PlayerStatus_NormalDeath        = 0x24B350;
 typedef granny_method_t PlayerStatus_NormalDeath_t;
 
 /**
+ * PlayerStatus::PlayerGettingStopped -- takes control away for a kill
+ * sequence, and the reason Immortality used to leave you frozen.
+ *
+ * It sets MobileFPS.isAllowedToMove and .AbleToMove to false and
+ * CrouchHolder.Disabled to true; control comes back from the death and
+ * respawn that normally follow. Suppressing only the deaths therefore froze
+ * the player permanently -- no movement, no camera -- which is exactly what
+ * the spider does:
+ *
+ *     PlayerStatus::PlayerGettingStopped();   // control taken
+ *     yield WaitForSeconds(0.4);
+ *     PlayerStatus::NormalDeath();            // patched to ret
+ *
+ * All three of its callers are kill paths -- AtticSpider's StingKill
+ * coroutine, GrannyCaughtYou and GrandpaCaughtYou -- so it belongs in the
+ * same patch group as the deaths rather than being handled separately.
+ */
+static const uintptr_t OFFSET_PlayerStatus_PlayerGettingStopped = 0x24B820;
+
+/**
  * AI_Granny::ResetAIDecision — 0x8f bytes. Tears down/nulls several
  * component references on the instance (calls into what look like
  * SetActive(false)/Stop()-style engine calls at offsets +168, +48/+40,
@@ -98,6 +118,26 @@ typedef granny_method_t AI_Granny_SmackTimer_t;
  */
 static const uintptr_t OFFSET_AI_Granny_FixedUpdate           = 0x1BDCC0;
 typedef granny_method_t AI_Granny_FixedUpdate_t;
+
+/**
+ * AI_MomSpider::Update -- the cellar spider's per-frame driver, hooked purely
+ * to capture the live instance, same trick as AI_Granny::FixedUpdate.
+ *
+ * A separate class from AtticSpider (the one that stings you in the attic):
+ * this is the big one that patrols the cellar on its own NavMeshAgent, with
+ * its own waypoints, webs and chase state. Only exists while that level is
+ * loaded, so the hook simply never fires elsewhere.
+ *
+ * Game-assembly method, so a single argument and no trailing MethodInfo*.
+ */
+static const uintptr_t OFFSET_AI_MomSpider_Update             = 0x1D6E20;
+typedef granny_method_t AI_MomSpider_Update_t;
+
+/* AI_MomSpider instance fields, for anything that wants them later. */
+static const uintptr_t FIELD_AI_MomSpider_Walk_Speed      = 0x20; /**< float */
+static const uintptr_t FIELD_AI_MomSpider_Run_Speed       = 0x24; /**< float */
+static const uintptr_t FIELD_AI_MomSpider_Agent           = 0x30; /**< NavMeshAgent* */
+static const uintptr_t FIELD_AI_MomSpider_IsChasing       = 0x62; /**< bool */
 
 /**
  * ItemSpawn::Update -- per-frame tick on the object that owns every item
@@ -406,3 +446,218 @@ static const uintptr_t OFFSET_GameObject_get_transform        = 0x720600;
  */
 static const uintptr_t OFFSET_GameObject_get_activeInHierarchy = 0x720460;
 typedef bool(__fastcall *GameObject_get_active_t)(void *instance, void *method);
+
+/*
+ * ==========================================================================
+ * MobileFPS -- the player controller. Move speed and noclip both live here.
+ * ==========================================================================
+ *
+ * Confirmed from MobileFPS::HandlePlayerMovement's decompile rather than
+ * guessed from the field names: the input vector is scaled by `moveSpeed`
+ * alone. SpeedMove/SpeedMoveCrouch are the stored presets the game copies
+ * into moveSpeed when you crouch and stand, so all three have to move
+ * together or a crouch undoes the override.
+ */
+
+/** MobileFPS::Update -- hooked to capture the live player, same trick as
+ *  AI_Granny::FixedUpdate. Game-assembly method: single argument. */
+static const uintptr_t OFFSET_MobileFPS_Update            = 0x22D9C0;
+typedef granny_method_t MobileFPS_Update_t;
+
+static const uintptr_t FIELD_MobileFPS_characterController = 0x28; /**< CharacterController* */
+static const uintptr_t FIELD_MobileFPS_moveSpeed           = 0x40; /**< float -- the live one */
+static const uintptr_t FIELD_MobileFPS_SpeedMove           = 0x44; /**< float -- standing preset */
+static const uintptr_t FIELD_MobileFPS_SpeedMoveCrouch     = 0x48; /**< float -- crouched preset */
+/**
+ * MobileFPS::InWeb -- set while the player is stuck in a spider web, which is
+ * the only thing the two speed constants above encode: Update writes 1.0/0.3
+ * while it is set and 6.0/2.8 otherwise. Checked before capturing the
+ * originals, so a web can't become the baseline the multiplier scales from.
+ */
+static const uintptr_t FIELD_MobileFPS_InWeb               = 0x89; /**< bool */
+/**
+ * MobileFPS::moveDirection -- the world-space step the game is about to hand
+ * to CharacterController::Move, already built from input and the camera's
+ * facing (ApplyFinalMovements multiplies it by deltaTime and nothing else).
+ *
+ * This is what makes noclip cheap: with the controller disabled the game's
+ * Move() call does nothing, and we can drive the transform with the game's
+ * own direction vector instead of re-deriving one from raw input.
+ */
+static const uintptr_t FIELD_MobileFPS_moveDirection       = 0x54; /**< Vector3 */
+
+/** UnityEngine.Vector3 -- three floats. Larger than 8 bytes, so it crosses
+ *  the Win64 ABI by pointer in both directions. */
+typedef struct {
+	float x, y, z;
+} unity_vector3;
+
+/*
+ * Traps. Each of these is a `private void OnTriggerEnter(Collider)` that
+ * fires the trap when the player walks into it -- there is no shared base
+ * class and no global enable, so disabling them means suppressing each entry
+ * point. Byte patched to `ret` rather than hooked, exactly like the death
+ * functions: nothing needs to run in their place.
+ *
+ * ExtraTrapsLogic is deliberately absent -- it only has Start/StartFunction
+ * and sets the level's traps up, so it has no trigger to suppress. Its .ctor
+ * shares RVA 0x1A26E0 with several other classes (identical COMDAT folding),
+ * which is a good reason never to patch a constructor here.
+ */
+static const uintptr_t OFFSET_TrapTrigger_OnTriggerEnter       = 0x211A10;
+static const uintptr_t OFFSET_BearTrapLogic_OnTriggerEnter     = 0x1A9A10;
+static const uintptr_t OFFSET_ExploTrapTrigger_OnTriggerEnter  = 0x1FC890;
+static const uintptr_t OFFSET_TrapPoison_OnTriggerEnter        = 0x261A10;
+
+/*
+ * More UnityEngine methods, all taking a trailing MethodInfo* that accepts
+ * NULL like the ones above.
+ */
+
+/** NavMeshAgent::set_speed -- `void f(NavMeshAgent *this, float, MethodInfo *)`.
+ *  Freezing her by zeroing Walk_Speed/Run_Speed alone leaves the agent
+ *  coasting at whatever speed it was last given, so the agent is told too. */
+static const uintptr_t OFFSET_NavMeshAgent_set_speed      = 0x6E67D0;
+
+/** Collider::set_enabled -- CharacterController derives from Collider, not
+ *  Behaviour, so its `enabled` property is this one. */
+static const uintptr_t OFFSET_Collider_set_enabled        = 0x769040;
+typedef void(__fastcall *Unity_set_bool_t)(void *instance, bool value, void *method);
+typedef void(__fastcall *Unity_set_float_t)(void *instance, float value, void *method);
+
+/** Transform::set_position -- `void f(Transform *this, Vector3 *value,
+ *  MethodInfo *)`. Confirmed by decompile: Vector3 is 12 bytes so it arrives
+ *  by pointer, and the function forwards straight to set_position_Injected. */
+static const uintptr_t OFFSET_Transform_set_position      = 0x747B20;
+typedef void(__fastcall *Transform_set_position_t)(void *instance, const unity_vector3 *value, void *method);
+
+/** Time::get_deltaTime -- static, `float f(MethodInfo *)`. */
+static const uintptr_t OFFSET_Time_get_deltaTime          = 0x72B210;
+typedef float(__fastcall *Time_get_deltaTime_t)(void *method);
+
+/*
+ * ==========================================================================
+ * Spawning an item
+ * ==========================================================================
+ *
+ * Recipe lifted from PickRay::CheckItemDropping, which is what runs when you
+ * press the drop key: Instantiate the ItemDrop prefab at the player's drop
+ * point, then write CountItem on the copy's ItemSpawn component. ItemSpawn's
+ * own Update does the rest -- it activates the chosen item, throws it,
+ * unparents it and destroys the dropper.
+ *
+ * So spawning is the same operation as dropping, minus the part where the
+ * game first takes the item out of your hands. Nothing has to be faked.
+ *
+ * (Hex-Rays renders the CountItem store as a write into `v43.klass`, which
+ * is misleading: v43 is the out-buffer of the shared-generic GetComponent,
+ * so it holds the ItemSpawn pointer, and the store is a plain float write at
+ * +0x24. The constants it writes -- 1.0f, 30.0f, 37.0f -- are CountItem
+ * values, which is what confirms the field's meaning.)
+ */
+
+/** PickRay::ItemDrop -- the dropper prefab that every dropped item comes
+ *  from. A prefab, so it is never active in the scene and never shows up in
+ *  a FindObjectsOfType scan. */
+static const uintptr_t FIELD_PickRay_ItemDrop             = 0x230; /**< GameObject* */
+/** PickRay::DropP -- the transform just in front of the player that the game
+ *  drops items at. Reusing it means a spawned item lands exactly where a
+ *  dropped one would, with no positioning maths of our own. */
+static const uintptr_t FIELD_PickRay_DropP                = 0x50;  /**< Transform* */
+
+/** UnityEngine.Object::Instantiate(GameObject, Vector3, Quaternion). Both
+ *  struct arguments are over 8 bytes, so both arrive by pointer. Needs its
+ *  baked generic MethodInfo -- NULL is not accepted here, unlike the plain
+ *  UnityEngine methods above. */
+static const uintptr_t OFFSET_Object_Instantiate          = 0x2CE440;
+/** Globals holding POINTERS to the baked MethodInfo, so dereference before
+ *  passing them on -- same shape as METHODINFO_GetComponent_ItemSeedData. */
+static const uintptr_t METHODINFO_Instantiate_GameObject  = 0xC3B3E0;
+static const uintptr_t METHODINFO_GetComponent_ItemSpawn  = 0xC338F0;
+
+/** UnityEngine.Quaternion -- four floats, so it crosses the ABI by pointer. */
+typedef struct {
+	float x, y, z, w;
+} unity_quaternion;
+
+typedef void *(__fastcall *Object_Instantiate_t)(void *original, const unity_vector3 *position,
+                                                 const unity_quaternion *rotation, void *method);
+
+/** Transform::get_rotation -- `Quaternion *f(Quaternion *ret, Transform *this,
+ *  MethodInfo *)`, same hidden-return shape as get_position. */
+static const uintptr_t OFFSET_Transform_get_rotation      = 0x747480;
+typedef void *(__fastcall *Transform_get_rotation_t)(void *ret_quaternion, void *instance, void *method);
+
+/*
+ * MobileFPS::Update rewrites SpeedMove and SpeedMoveCrouch from hardcoded
+ * constants at the top of EVERY frame, before anything reads them:
+ *
+ *     SpeedMove       = InWeb ? 1.0f : 6.0f;
+ *     SpeedMoveCrouch = InWeb ? 0.3f : 2.8f;
+ *     ...
+ *     moveSpeed = IsCrouched ? SpeedMoveCrouch : SpeedMove;
+ *
+ * which is why writing those fields from a hook did nothing -- the store
+ * landed and was overwritten microseconds later in the same call. There is
+ * no setter to intercept and HandlePlayerMovement isn't even called (Update
+ * inlines it), so the two stores are NOPed out instead and the fields then
+ * keep whatever we put in them.
+ *
+ *   0x22DABA  f3 0f 11 4f 44    movss [rdi+44h], xmm1   ; SpeedMove
+ *   0x22DABF  f3 0f 11 47 48    movss [rdi+48h], xmm0   ; SpeedMoveCrouch
+ *
+ * Side effect worth knowing: InWeb no longer slows the player either, since
+ * that is the only thing those two constants encode.
+ */
+static const uintptr_t OFFSET_MobileFPS_SpeedStores       = 0x22DABA;
+#define MOBILEFPS_SPEED_STORES_SIZE 10
+
+/*
+ * FallingHolder -- the script that decides whether the player is falling,
+ * and it is the reason noclip needs cleaning up after.
+ *
+ * FallingHolder::Update keys everything off CharacterController.isGrounded,
+ * and a DISABLED controller reports false forever. So for as long as noclip
+ * has the controller switched off the game believes the player is in an
+ * endless fall:
+ *
+ *     isFalling = true;
+ *     fallDuration += Time.deltaTime * Speed;
+ *     if (fallDuration > FallMega && !DeathFall && !Damaged) {
+ *         Damaged = true;
+ *         HandleLanding();
+ *         PickRay::CheckItemDropping();     // drops whatever you hold
+ *     }
+ *
+ * and the consequences outlive noclip: CrouchHolder::Update refuses to
+ * crouch or stand while isFalling or isLanding is set, MobileFPS::Update
+ * forces moveSpeed to 0 while isFalling, and a big enough fallDuration on
+ * the next grounded frame calls PlayerStatus::NormalDeath.
+ *
+ * Hence the whole block is held at zero while noclip is on. That isn't a
+ * workaround so much as the truth: a player who is flying is not falling.
+ */
+static const uintptr_t FIELD_MobileFPS_FallingHolder      = 0xA0; /**< FallingHolder* */
+
+/* Six contiguous bools at 0x80..0x85, then two floats. Cleared as a group. */
+static const uintptr_t FIELD_FallingHolder_FLAGS_FIRST    = 0x80; /**< CanFallSound */
+#define FALLINGHOLDER_FLAG_COUNT 6                                /**< ..DeathFall at 0x85 */
+/*
+ * The two thresholds a fall is measured against, both in the same units as
+ * fallDuration. From FallingHolder::Update:
+ *
+ *     if (fallDuration > FallMega)         -> death, if DeathFall is set
+ *     if (fallDuration > FallDurationHold) -> HandleLanding(), the get-up
+ *     if (fallDuration <= FallChecker)     -> silent landing
+ *     otherwise                            -> the small landing sound
+ *
+ * so keeping fallDuration at or below FallDurationHold is what turns a
+ * bone-shaking landing into an ordinary one.
+ */
+static const uintptr_t FIELD_FallingHolder_FallDurationHold = 0x50; /**< float */
+static const uintptr_t FIELD_FallingHolder_FallMega         = 0x58; /**< float */
+
+static const uintptr_t FIELD_FallingHolder_isFalling      = 0x81; /**< bool */
+static const uintptr_t FIELD_FallingHolder_isLanding      = 0x82; /**< bool */
+static const uintptr_t FIELD_FallingHolder_fallDuration   = 0x88; /**< float */
+static const uintptr_t FIELD_FallingHolder_DurateCan      = 0x8C; /**< float */

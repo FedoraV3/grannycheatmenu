@@ -3,6 +3,8 @@
 #include "game/offsets.h"
 #include "overlay/d3d11_hook.h"
 #include "game/ai_granny_hook.h"
+#include "game/player.h"
+#include "core/config.h"
 #include "overlay/esp.h"
 
 /**
@@ -44,6 +46,17 @@ static DWORD WINAPI main_thread(LPVOID param) {
      * ESP's cross-thread state needs its lock to exist first. */
     esp_init();
 
+    /* Before the overlay, deliberately. Loading afterwards left the menu
+     * usable for the whole wait_for_module window below -- up to five
+     * seconds -- and then silently overwrote anything toggled in it. Worse,
+     * config_apply() would have been patching code from this thread while
+     * the player could be clicking the same checkbox on the present thread,
+     * and granny_set_death_disabled has no lock to make that safe.
+     *
+     * Only the values are restored here; config_apply() still has to wait
+     * until the hooks exist, further down. */
+    config_load();
+
     if (!d3d11_hook_install()) {
         OutputDebugStringA("[cheat] d3d11 hook failed, menu will not render");
     }
@@ -76,9 +89,18 @@ static DWORD WINAPI main_thread(LPVOID param) {
         OutputDebugStringA("[cheat] AI_Granny hook failed, no live instance tracking");
     }
 
+    if (!player_hook_install()) {
+        OutputDebugStringA("[cheat] MobileFPS hook failed, move speed and noclip will do nothing");
+    }
+
     if (!esp_install_hooks()) {
         OutputDebugStringA("[cheat] ESP hooks failed, item ESP will have no data");
     }
+
+    /* The other half of the load, now that every hook exists: config_apply()
+     * re-enables the catch detours and re-applies the byte patches for
+     * whatever was saved, neither of which is safe any earlier. */
+    config_apply();
 
     OutputDebugStringA("[cheat] resolved GameAssembly.dll offsets");
     return 0;
