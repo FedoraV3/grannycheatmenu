@@ -46,6 +46,17 @@ extern bool granny_is_blind;
 extern bool granny_is_deaf;
 
 /**
+ * @brief Push `granny_is_deaf` into the game.
+ *
+ * Byte patches the test that decides whether she picks up a noise object.
+ * Reverts the flag if the patch fails, so the menu never shows a state the
+ * game isn't in. Safe from the menu thread: it writes to code pages only.
+ *
+ * @return true if the game is now in the requested state.
+ */
+bool granny_apply_deaf(void);
+
+/**
  * @brief Disable or restore PlayerStatus::NormalDeath and ::KnockDeath by
  * byte patch.
  *

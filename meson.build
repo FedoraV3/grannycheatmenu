@@ -60,6 +60,7 @@ cheat_sources = [
 
     'src/overlay/d3d11_hook.cpp',
     'src/overlay/esp.cpp',
+    'src/overlay/notify.cpp',
 ]
 
 shared_library('cheat', cheat_sources,

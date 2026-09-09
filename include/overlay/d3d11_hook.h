@@ -40,6 +40,16 @@ int d3d11_hook_install(void);
 int overlay_wants_keyboard(void);
 
 /**
+ * @brief Whether the cheat menu is currently open.
+ *
+ * Lets the overlay keep its diagnostics to itself while you're playing. Safe
+ * from any thread: a plain flag, and a frame of staleness costs nothing.
+ *
+ * @return Nonzero while the menu is visible.
+ */
+int overlay_menu_open(void);
+
+/**
  * @brief Disable the Present hook and uninitialize MinHook.
  *
  * Only call this once nothing else in the process is relying on MinHook

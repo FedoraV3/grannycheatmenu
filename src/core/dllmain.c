@@ -6,6 +6,7 @@
 #include "game/player.h"
 #include "core/config.h"
 #include "overlay/esp.h"
+#include "overlay/notify.h"
 
 /**
  * @brief Poll for a module to appear, in case we're mapped in before it loads.
@@ -45,6 +46,9 @@ static DWORD WINAPI main_thread(LPVOID param) {
     /* Before any hook that can reach esp_collect() is enabled, since the
      * ESP's cross-thread state needs its lock to exist first. */
     esp_init();
+    /* Same reasoning: a toast can be pushed the moment a hook fires, so the
+     * list's lock has to exist before any of them are installed. */
+    notify_init();
 
     /* Before the overlay, deliberately. Loading afterwards left the menu
      * usable for the whole wait_for_module window below -- up to five

@@ -8,6 +8,7 @@
 #include "game/traps.h"
 #include "game/unlock.h"
 #include "overlay/esp.h"
+#include "overlay/notify.h"
 
 #include <windows.h>
 #include <stdio.h>
@@ -24,6 +25,11 @@ typedef struct {
 	const char *name;
 	cfg_type type;
 	void *value;
+	/* The range the menu's widget offers. A config file is hand-editable and
+	 * survives across versions, so without this it can hold values the UI
+	 * cannot produce and cannot show -- notify_duration=0 kills every toast
+	 * while the checkbox still reads enabled. Both zero means unbounded. */
+	double lo, hi;
 } cfg_entry;
 
 /*
@@ -39,7 +45,7 @@ static const cfg_entry g_entries[] = {
 	{ "immortality",          CFG_BOOL,  &immortality },
 	{ "noclip",               CFG_BOOL,  &player_noclip_enabled },
 	{ "move_speed_enabled",   CFG_BOOL,  &player_speed_enabled },
-	{ "move_speed",           CFG_FLOAT, &player_speed_multiplier },
+	{ "move_speed",           CFG_FLOAT, &player_speed_multiplier , 0.1, 10.0 },
 	{ "no_hard_landing",      CFG_BOOL,  &player_no_hard_landing },
 	{ "air_control",          CFG_BOOL,  &player_air_control },
 
@@ -47,28 +53,32 @@ static const cfg_entry g_entries[] = {
 	{ "granny_deaf",          CFG_BOOL,  &granny_is_deaf },
 	{ "granny_freeze",        CFG_BOOL,  &granny_freeze_enabled },
 	{ "granny_speed_enabled", CFG_BOOL,  &granny_speed_enabled },
-	{ "granny_walk_speed",    CFG_FLOAT, &granny_walk_speed },
-	{ "granny_run_speed",     CFG_FLOAT, &granny_run_speed },
+	{ "granny_walk_speed",    CFG_FLOAT, &granny_walk_speed , 0.0, 500.0 },
+	{ "granny_run_speed",     CFG_FLOAT, &granny_run_speed , 0.0, 500.0 },
 
 	{ "traps_disabled",       CFG_BOOL,  &traps_disabled },
 	{ "unlock_without_keys",  CFG_BOOL,  &unlock_enabled },
-	{ "spawn_selected",       CFG_INT,   &spawn_selected_index },
+	{ "spawn_selected",       CFG_INT,   &spawn_selected_index , 0, ITEMSPAWN_ITEM_COUNT - 1 },
 
 	{ "fullbright",           CFG_BOOL,  &fullbright_enabled },
 	{ "granny_esp",           CFG_BOOL,  &esp_granny_enabled },
 	{ "item_esp",             CFG_BOOL,  &esp_items_enabled },
 	{ "momspider_esp",        CFG_BOOL,  &esp_momspider_enabled },
 	{ "esp_arrows",           CFG_BOOL,  &esp_arrows_enabled },
-	{ "esp_arrow_size",       CFG_FLOAT, &esp_arrow_size },
-	{ "esp_arrow_margin",     CFG_FLOAT, &esp_arrow_margin },
+	{ "esp_arrow_size",       CFG_FLOAT, &esp_arrow_size , 10.0, 60.0 },
+	{ "esp_arrow_margin",     CFG_FLOAT, &esp_arrow_margin , 20.0, 200.0 },
 	{ "esp_escape",           CFG_BOOL,  &esp_show_escape_items },
 	{ "esp_escape_puzzle",    CFG_BOOL,  &esp_show_escape_puzzle_items },
 	{ "esp_puzzle",           CFG_BOOL,  &esp_show_puzzle_items },
 	{ "esp_other",            CFG_BOOL,  &esp_show_other_items },
-	{ "esp_box_height",       CFG_FLOAT, &esp_box_height },
-	{ "esp_box_width",        CFG_FLOAT, &esp_box_width_ratio },
-	{ "esp_spider_height",    CFG_FLOAT, &esp_spider_box_height },
-	{ "esp_spider_width",     CFG_FLOAT, &esp_spider_box_width_ratio },
+	{ "esp_box_height",       CFG_FLOAT, &esp_box_height , 0.5, 5.0 },
+	{ "esp_box_width",        CFG_FLOAT, &esp_box_width_ratio , 0.1, 1.5 },
+	{ "esp_spider_height",    CFG_FLOAT, &esp_spider_box_height , 0.3, 4.0 },
+	{ "esp_spider_width",     CFG_FLOAT, &esp_spider_box_width_ratio , 0.2, 3.0 },
+
+	{ "notifications",        CFG_BOOL,  &notify_enabled },
+	{ "notify_position",      CFG_INT,   &notify_position , 0, NOTIFY_POSITION_COUNT - 1 },
+	{ "notify_duration",      CFG_FLOAT, &notify_duration , 0.5, 8.0 },
 };
 
 #define CFG_ENTRY_COUNT ((int)(sizeof(g_entries) / sizeof(g_entries[0])))
@@ -121,15 +131,28 @@ static void assign(const cfg_entry *entry, const char *text) {
 	case CFG_BOOL:
 		*(bool *)entry->value = (atoi(text) != 0);
 		break;
-	case CFG_INT:
-		*(int *)entry->value = atoi(text);
+	case CFG_INT: {
+		int v = atoi(text);
+		if (entry->lo != entry->hi) {
+			if (v < (int)entry->lo) v = (int)entry->lo;
+			if (v > (int)entry->hi) v = (int)entry->hi;
+		}
+		*(int *)entry->value = v;
 		break;
+	}
 	case CFG_FLOAT:
 		/* strtod, not atof: a config written under a locale that uses a
 		 * comma decimal separator would otherwise silently truncate every
 		 * float to its integer part. strtod is locale-dependent too, but at
 		 * least it reports how far it got. */
-		*(float *)entry->value = (float)strtod(text, NULL);
+		{
+			double v = strtod(text, NULL);
+			if (entry->lo != entry->hi) {
+				if (v < entry->lo) v = entry->lo;
+				if (v > entry->hi) v = entry->hi;
+			}
+			*(float *)entry->value = (float)v;
+		}
 		break;
 	}
 }
@@ -197,6 +220,7 @@ void config_apply(void) {
 	/* Only the two that need more than their flag set. Both are idempotent,
 	 * so calling them when nothing was loaded is harmless. */
 	if (immortality) granny_apply_immortality();
+	if (granny_is_deaf) granny_apply_deaf();
 	if (traps_disabled) traps_apply();
 	if (unlock_enabled) unlock_apply();
 	if (player_air_control) player_apply_air_control();

@@ -84,16 +84,14 @@ static void __fastcall hooked_fixed_update(void *instance) {
 		*(volatile bool *)((uintptr_t)instance + FIELD_AI_Granny_IsBlind) = true;
 	}
 
-	/* Deafness, synthesised -- the class has no IsDeaf flag to match IsBlind.
+	/* Deafness is done by the byte patch in granny_apply_deaf(), which stops
+	 * her acquiring a noise at all. This only drops one she was ALREADY
+	 * following when the toggle went on -- without it she finishes walking to
+	 * the last thing she heard before going deaf, which reads as the feature
+	 * not working.
 	 *
-	 * Cleared before the original runs, so FixedUpdate finds no noise to act
-	 * on this tick rather than being interrupted midway through reacting to
-	 * one. NoiseObj is a managed reference, and writing NULL over one needs
-	 * no GC write barrier, so this is a plain store like the rest.
-	 *
-	 * Like blind, this only writes while the toggle is ON: forcing the
-	 * fields to false otherwise would fight the game's own noise handling
-	 * every tick for no reason. */
+	 * NoiseObj is a managed reference, and writing NULL over one needs no GC
+	 * write barrier, so this is a plain store like the rest. */
 	if (granny_is_deaf && instance != NULL) {
 		*(volatile bool *)((uintptr_t)instance + FIELD_AI_Granny_IsFollowingSound) = false;
 		*(void *volatile *)((uintptr_t)instance + FIELD_AI_Granny_NoiseObj) = NULL;
@@ -213,6 +211,52 @@ bool granny_is_stopped(void) {
 		g_stopped_instance = NULL;
 		return false;
 	}
+	return true;
+}
+
+/*
+ * Deaf is a byte patch, not a field write.
+ *
+ * `and al, 0` over the `test al, al` that asks whether FindGameObjectWithTag
+ * turned up a noise object -- ZF ends up set either way, so the jz that skips
+ * the whole acquisition is always taken.
+ */
+#define DEAF_PATCH_SIZE AI_GRANNY_NOISE_ACQUIRE_SIZE
+static const uint8_t g_deaf_patch[DEAF_PATCH_SIZE] = { 0x24, 0x00 };  /* and al, 0  */
+static const uint8_t g_deaf_expect[DEAF_PATCH_SIZE] = { 0x84, 0xC0 }; /* test al, al */
+static uint8_t g_deaf_original[DEAF_PATCH_SIZE];
+static bool g_deaf_patched = false;
+
+bool granny_apply_deaf(void) {
+	if (g_gameassembly_base == 0) {
+		granny_is_deaf = false;
+		return false;
+	}
+	if (granny_is_deaf == g_deaf_patched) return true;
+
+	const uintptr_t site = g_gameassembly_base + OFFSET_AI_Granny_NoiseAcquire;
+
+	if (granny_is_deaf) {
+		if (!patch_bytes_checked(site, g_deaf_expect, g_deaf_patch,
+		                         DEAF_PATCH_SIZE, g_deaf_original)) {
+			OutputDebugStringA("[cheat] noise acquisition is not `test al, al`, refusing to patch");
+			granny_is_deaf = false;
+			return false;
+		}
+		g_deaf_patched = true;
+		OutputDebugStringA("[cheat] granny deafened");
+		return true;
+	}
+
+	/* A failed restore keeps the flag set, so the next enable can't save our
+	 * own bytes over the only copy of that instruction. */
+	if (!restore_bytes_local(site, g_deaf_original, DEAF_PATCH_SIZE)) {
+		OutputDebugStringA("[cheat] failed to restore the noise acquisition");
+		granny_is_deaf = true;
+		return false;
+	}
+	g_deaf_patched = false;
+	OutputDebugStringA("[cheat] granny hearing restored");
 	return true;
 }
 

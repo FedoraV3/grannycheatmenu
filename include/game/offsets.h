@@ -208,6 +208,34 @@ typedef granny_method_t PickRay_Update_t;
  * reads a flag off this object and either runs the unlock or prints "It's
  * locked". Confirmed by tracing the padlocked port -- see unlock.c.
  */
+/**
+ * PickRay::Drop1 -- the drop button, and the game's "you are holding
+ * something" flag: the drop key does nothing unless this is activeSelf.
+ *
+ *     mov  ecx, [rbx+53Ch]              ; DropKey
+ *     call Input::GetKeyDown
+ *     test al, al
+ *     jz   no drop
+ *     mov  rcx, [rbx+30h]               ; Drop1
+ *     call GameObject::get_activeSelf
+ *     test al, al
+ *     jz   no drop
+ *
+ * Every interaction path calls Drop1.SetActive(false) afterwards, which is
+ * right when you really did use the item you were holding. With the unlock
+ * checks forced it fires while your hands are still full, and dropping stays
+ * dead until you pick something else up.
+ */
+static const uintptr_t FIELD_PickRay_Drop1                = 0x30;  /**< GameObject* */
+
+/** GameObject::get_activeSelf -- `bool f(GameObject *this, MethodInfo *)`.
+ *  Not activeInHierarchy: this is the object's own flag, ignoring whether an
+ *  ancestor is switched off, and it is what the drop gate reads. */
+static const uintptr_t OFFSET_GameObject_get_activeSelf   = 0x7204A0;
+
+/** GameObject::SetActive -- `void f(GameObject *this, bool, MethodInfo *)`. */
+static const uintptr_t OFFSET_GameObject_SetActive        = 0x720060;
+
 static const uintptr_t FIELD_PickRay_HP                   = 0x4D8; /**< HandlePuzzles* */
 
 /**
@@ -376,6 +404,34 @@ static const uintptr_t FIELD_AI_Granny_EnemyVision        = 0x108; /**< Eyes_Gra
 static const uintptr_t FIELD_AI_Granny_IsBlind            = 0x164; /**< bool -- the game's own blind flag */
 static const uintptr_t FIELD_AI_Granny_BlindTimer         = 0x168; /**< float -- counts the blind state down */
 
+/**
+ * The test that decides whether she picks up a noise, inside FixedUpdate.
+ *
+ *     mov  rcx, [rbx+1F8h]                  ; NoiseObjectTag
+ *     call GameObject::FindGameObjectWithTag
+ *     call Object::op_Implicit              ; did it find a real one?
+ *     test al, al                           ; <-- patched here
+ *     jz   skip
+ *     cmp  [rbx+18Dh], r15b                 ; IsChasing
+ *     ... IsAngry, IsDying, PepperedEnemy ...
+ *     mov  byte ptr [rbx+18Ch], 1           ; IsFollowingSound = true
+ *     call GameObject::FindGameObjectWithTag
+ *     mov  [rbx+1E8h], rax                  ; NoiseObj = it
+ *
+ * `and al, 0` is the same two bytes as `test al, al` and always sets ZF, so
+ * the jz is always taken and she never latches onto a noise in the first
+ * place.
+ *
+ * Clearing IsFollowingSound and NoiseObj from the hook instead does NOT
+ * work, which is what the first attempt at Deaf did: the fields are set and
+ * acted on inside the same FixedUpdate, so a clear beforehand is overwritten
+ * immediately, and a clear afterwards is too late -- the NavMeshAgent has
+ * already been given the destination, and dropping the reference doesn't
+ * recall it. She walks to the noise either way.
+ */
+static const uintptr_t OFFSET_AI_Granny_NoiseAcquire      = 0x1BF094;
+#define AI_GRANNY_NOISE_ACQUIRE_SIZE 2
+
 /*
  * Hearing. Note there is NO IsDeaf flag to match IsBlind -- deafness has to
  * be synthesised from these (clear IsFollowingSound/NoiseObj each tick, pin
@@ -441,6 +497,23 @@ typedef void *(__fastcall *Component_get_transform_t)(void *instance, void *meth
 /** Transform::get_position -- `Vector3 *f(Vector3 *ret, Transform *this, MethodInfo *)`. */
 static const uintptr_t OFFSET_Transform_get_position          = 0x747310;
 typedef void *(__fastcall *Transform_get_position_t)(void *ret_vector3, void *instance, void *method);
+
+/**
+ * Behaviour::get_isActiveAndEnabled -- `bool f(Behaviour *this, MethodInfo *)`.
+ *
+ * True only when the component is enabled AND its GameObject is active in
+ * the hierarchy, which is precisely the question "is this the camera that is
+ * actually rendering". A Camera is a Behaviour, so this works on one
+ * directly.
+ *
+ * Needed because hiding -- under a bed, in the car -- swaps the game to a
+ * different camera and disables PlayerCam, without destroying it. Liveness
+ * can't see that: m_CachedPtr is still set, so PlayerCam still looks
+ * perfectly good and hands back the matrices it had when it was last
+ * rendering. That is how the ESP came to sit there drawing a frozen frame
+ * while you were hidden.
+ */
+static const uintptr_t OFFSET_Behaviour_get_isActiveAndEnabled = 0x71CDB0;
 
 /** Camera::get_main -- static, `Camera *f(MethodInfo *)`. */
 static const uintptr_t OFFSET_Camera_get_main                 = 0x6FE450;

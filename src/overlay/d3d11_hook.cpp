@@ -9,6 +9,7 @@
 #include "game/unlock.h"
 #include "core/keybinds.h"
 #include "core/config.h"
+#include "overlay/notify.h"
 #include "overlay/esp.h"
 #include "MinHook.h"
 
@@ -61,6 +62,10 @@ static volatile bool g_overlay_wants_keyboard = false;
 
 extern "C" int overlay_wants_keyboard(void) {
     return g_overlay_wants_keyboard ? 1 : 0;
+}
+
+extern "C" int overlay_menu_open(void) {
+    return g_menu_visible ? 1 : 0;
 }
 
 static void create_render_target(IDXGISwapChain *swap_chain) {
@@ -176,16 +181,37 @@ static void init_imgui(IDXGISwapChain *swap_chain) {
  * a loaded config all take the same path instead of three copies that drift.
  */
 
+/*
+ * A checkbox that announces itself.
+ *
+ * The menu already shows the state, so this looks redundant -- but a click
+ * and a keybind should be indistinguishable to everything downstream, and
+ * routing both through one place is what stops the two drifting apart as
+ * toggles get added. The label is the toast text, so they cannot disagree.
+ *
+ * Toggles whose flag can revert -- anything with a byte patch behind it --
+ * are deliberately NOT done here: they have to report the state AFTER the
+ * apply, or the toast says what you asked for rather than what happened.
+ */
+static bool notify_checkbox(const char *label, bool *value) {
+	if (!ImGui::Checkbox(label, value)) return false;
+	notify_toggle(label, *value);
+	return true;
+}
+
 static void draw_player_tab() {
 	if (ImGui::Checkbox("Immortality", &immortality)) {
 		granny_apply_immortality();
+		/* After the apply: a failed death patch reverts the flag, and the
+		 * toast should say what happened, not what was asked for. */
+		notify_toggle("Immortality", immortality);
 	}
 
 	ImGui::Separator();
 
 	/* Both of these are applied on the game thread by player_tick(); the
 	 * widgets only set flags. */
-	ImGui::Checkbox("Noclip", &player_noclip_enabled);
+	notify_checkbox("Noclip", &player_noclip_enabled);
 	if (ImGui::IsItemHovered()) {
 		ImGui::SetTooltip("Walk through walls. Space rises, Ctrl descends.\n"
 		                  "Switching it off while inside geometry can wedge you.");
@@ -193,6 +219,7 @@ static void draw_player_tab() {
 
 	if (ImGui::Checkbox("Air control", &player_air_control)) {
 		player_apply_air_control();
+		notify_toggle("Air control", player_air_control);
 	}
 	if (ImGui::IsItemHovered()) {
 		ImGui::SetTooltip("Steer while falling.\n"
@@ -200,7 +227,7 @@ static void draw_player_tab() {
 		                  "this leaves landings and fall damage alone.");
 	}
 
-	ImGui::Checkbox("No hard landing", &player_no_hard_landing);
+	notify_checkbox("No hard landing", &player_no_hard_landing);
 	if (ImGui::IsItemHovered()) {
 		ImGui::SetTooltip("Drop from any height and keep walking.\n"
 		                  "Removes the stagger and the get-up animation.\n"
@@ -208,6 +235,7 @@ static void draw_player_tab() {
 	}
 
 	bool speed_changed = ImGui::Checkbox("Override move speed", &player_speed_enabled);
+	if (speed_changed) notify_toggle("Move speed", player_speed_enabled);
 	ImGui::BeginDisabled(!player_speed_enabled);
 	/* A multiplier rather than an absolute speed: the game keeps a separate
 	 * standing and crouched speed, and scaling both preserves the difference
@@ -236,8 +264,10 @@ static void draw_granny_tab() {
 			/* Only fails when nothing is ticking -- she isn't spawned, or
 			 * she's switched off in the game's own options. */
 			g_stop_granny_failed = true;
+			notify_warn("Stop granny: no Granny in the level");
 		} else {
 			g_stop_granny_failed = false;
+			notify_push("Stop granny: done");
 		}
 	}
 
@@ -249,12 +279,13 @@ static void draw_granny_tab() {
 
 	/* Re-applied every FixedUpdate tick rather than on toggle, since the
 	 * game's BlindTimer clears IsBlind by itself. */
-	ImGui::Checkbox("Blind (ignore sight)", &granny_is_blind);
+	notify_checkbox("Blind (ignore sight)", &granny_is_blind);
 
 	/* Applied on the game thread by granny_ai_tick(). The sliders seed
 	 * themselves from her real speeds the first time she's seen, so they
 	 * start at the difficulty's values rather than arbitrary ones. */
 	bool speed_changed = ImGui::Checkbox("Override speed", &granny_speed_enabled);
+	if (speed_changed) notify_toggle("Granny speed", granny_speed_enabled);
 	ImGui::BeginDisabled(!granny_speed_enabled);
 	speed_changed |= ImGui::SliderFloat("Walk speed", &granny_walk_speed, 0.0f, 500.0f, "%.2f");
 	speed_changed |= ImGui::SliderFloat("Run speed", &granny_run_speed, 0.0f, 500.0f, "%.2f");
@@ -278,6 +309,7 @@ static void draw_granny_tab() {
 	 * the restore branch and she'd stay pinned at zero. */
 	if (ImGui::Checkbox("Freeze in place", &granny_freeze_enabled)) {
 		granny_speed_mark_dirty();
+		notify_toggle("Freeze in place", granny_freeze_enabled);
 	}
 	if (granny_freeze_enabled) {
 		ImGui::TextDisabled("Overrides the speed sliders while it's on.");
@@ -285,7 +317,11 @@ static void draw_granny_tab() {
 
 	/* Re-applied every FixedUpdate tick like Blind -- the game keeps handing
 	 * her fresh noises, so a single write wouldn't hold. */
-	ImGui::Checkbox("Deaf (ignore sound)", &granny_is_deaf);
+	if (ImGui::Checkbox("Deaf (ignore sound)", &granny_is_deaf)) {
+		granny_apply_deaf();
+		/* After the apply, like the other patch-backed toggles. */
+		notify_toggle("Deaf", granny_is_deaf);
+	}
 }
 
 static void draw_world_tab() {
@@ -293,6 +329,7 @@ static void draw_world_tab() {
 	 * this thread -- unlike the spawn below. */
 	if (ImGui::Checkbox("Disable traps", &traps_disabled)) {
 		traps_apply();
+		notify_toggle("Disable traps", traps_disabled);
 	}
 	ImGui::TextDisabled("Bear traps, poison, explosives and the generic trigger.");
 	ImGui::TextDisabled("The traps stay visible -- they just stop firing.");
@@ -300,6 +337,7 @@ static void draw_world_tab() {
 	ImGui::Separator();
 	if (ImGui::Checkbox("Unlock without keys", &unlock_enabled)) {
 		unlock_apply();
+		notify_toggle("Unlock without keys", unlock_enabled);
 	}
 	if (ImGui::IsItemHovered()) {
 		ImGui::SetTooltip("Interacting succeeds instead of saying \"I need a ...\"\n"
@@ -330,6 +368,12 @@ static void draw_world_tab() {
 	 * happens on the next PickRay tick. */
 	if (ImGui::Button("Spawn")) {
 		spawn_request_item(spawn_selected_index);
+		/* notify_push bounds its own copy, so hand it the pieces rather than
+		 * formatting into a fixed buffer wsprintfA would happily overrun. */
+		char line[64];
+		lstrcpynA(line, "Spawned ", sizeof(line));
+		lstrcpynA(line + 8, spawn_item_name(spawn_selected_index), (int)sizeof(line) - 8);
+		notify_push(line);
 	}
 	ImGui::SameLine();
 	ImGui::TextDisabled("Lands at your drop point, same as dropping it.");
@@ -340,9 +384,13 @@ static void draw_world_tab() {
 	if (spawn_bulk_active()) {
 		char label[64];
 		wsprintfA(label, "Stop (%d left)", spawn_bulk_remaining());
-		if (ImGui::Button(label)) spawn_cancel_all();
+		if (ImGui::Button(label)) {
+			spawn_cancel_all();
+			notify_push("Spawn every item: stopped");
+		}
 	} else if (ImGui::Button("Spawn every item")) {
 		spawn_request_all();
+		notify_push("Spawning every item...");
 	}
 	ImGui::SameLine();
 	ImGui::TextDisabled("All 55, dropped over about a second.");
@@ -402,18 +450,18 @@ static void draw_visuals_tab() {
 	/* These two are live -- the ESP layer renders as soon as they're on.
 	 * Until the camera matrix is sourced from the game it just draws a
 	 * status line saying so, rather than nothing at all. */
-	ImGui::Checkbox("Granny ESP", &esp_granny_enabled);
-	ImGui::Checkbox("Item ESP", &esp_items_enabled);
+	notify_checkbox("Granny ESP", &esp_granny_enabled);
+	notify_checkbox("Item ESP", &esp_items_enabled);
 
 	/* The cellar's AI_MomSpider -- a different class from the attic spider
 	 * that stings you, and the only other thing in the game that hunts. */
-	ImGui::Checkbox("Mom Spider ESP", &esp_momspider_enabled);
+	notify_checkbox("Mom Spider ESP", &esp_momspider_enabled);
 	if (ImGui::IsItemHovered()) {
 		ImGui::SetTooltip("The big spider in the cellar.\n"
 		                  "Nothing to show anywhere else in the house.");
 	}
 
-	ImGui::Checkbox("Off-screen arrows", &esp_arrows_enabled);
+	notify_checkbox("Off-screen arrows", &esp_arrows_enabled);
 	if (ImGui::IsItemHovered()) {
 		ImGui::SetTooltip("Points at whichever enemies are switched on above,\n"
 		                  "while they're off the screen or behind you.\n"
@@ -429,10 +477,10 @@ static void draw_visuals_tab() {
 	/* Categories are the game's own, straight off ItemSeedData::category. */
 	ImGui::Indent();
 	ImGui::TextDisabled("Item categories");
-	ImGui::Checkbox("Escape only", &esp_show_escape_items);
-	ImGui::Checkbox("Escape + puzzle", &esp_show_escape_puzzle_items);
-	ImGui::Checkbox("Puzzle only", &esp_show_puzzle_items);
-	ImGui::Checkbox("Other / free", &esp_show_other_items);
+	notify_checkbox("Escape only", &esp_show_escape_items);
+	notify_checkbox("Escape + puzzle", &esp_show_escape_puzzle_items);
+	notify_checkbox("Puzzle only", &esp_show_puzzle_items);
+	notify_checkbox("Other / free", &esp_show_other_items);
 	ImGui::Unindent();
 
 	/* Her model's real height in world units isn't something we can read
@@ -461,7 +509,30 @@ static void draw_visuals_tab() {
 	ImGui::Separator();
 	/* Applied on the game's main thread by fullbright_tick(); this only
 	 * flips the flag. */
-	ImGui::Checkbox("Fullbright", &fullbright_enabled);
+	notify_checkbox("Fullbright", &fullbright_enabled);
+
+	ImGui::Separator();
+	notify_checkbox("Notifications", &notify_enabled);
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip("Announce what a keybind just did.\n"
+		                  "Shown whether or not the menu is open.");
+	}
+	if (notify_enabled) {
+		ImGui::Indent();
+		if (ImGui::BeginCombo("Position", notify_position_name(notify_position))) {
+			for (int i = 0; i < NOTIFY_POSITION_COUNT; i++) {
+				const bool selected = (i == notify_position);
+				if (ImGui::Selectable(notify_position_name(i), selected)) notify_position = i;
+				if (selected) ImGui::SetItemDefaultFocus();
+			}
+			ImGui::EndCombo();
+		}
+		ImGui::SliderFloat("Hold for", &notify_duration, 0.5f, 8.0f, "%.1f s");
+		if (ImGui::Button("Test notification")) {
+			notify_toggle("Test", true);
+		}
+		ImGui::Unindent();
+	}
 }
 
 /* Live state, for working out what's actually resolved at runtime while
@@ -567,12 +638,23 @@ static void draw_menu() {
 	 * applied to that tab's settings. */
 	ImGui::Separator();
 	if (ImGui::Button("Save config")) {
-		config_save();
+		/* config_status() carries the reason on failure, so it is worth
+		 * showing either way rather than a bare "saved". */
+		if (config_save()) {
+			notify_push("Config saved");
+		} else {
+			notify_warn(config_status());
+		}
 	}
 	ImGui::SameLine();
 	if (ImGui::Button("Reload config")) {
-		config_load();
+		const bool loaded = config_load();
 		config_apply();
+		if (loaded) {
+			notify_push(config_status());
+		} else {
+			notify_warn(config_status());
+		}
 	}
 	ImGui::SameLine();
 	ImGui::TextDisabled("%s", config_status());
@@ -593,6 +675,8 @@ static void render_frame() {
     if (g_menu_visible) {
         draw_menu();
     }
+    /* Above the ESP so a toast is never buried under a box. */
+    notify_render();
     /* ESP draws whether or not the menu is open -- it's meant to be up
      * while you're actually playing. */
     esp_render();
@@ -630,53 +714,104 @@ static void handle_keybinds() {
         io.MouseDrawCursor = g_menu_visible;
     }
 
-    if (keybind_pressed(KEYBIND_GRANNY_ESP)) esp_granny_enabled = !esp_granny_enabled;
-    if (keybind_pressed(KEYBIND_ITEM_ESP))   esp_items_enabled = !esp_items_enabled;
-    if (keybind_pressed(KEYBIND_MOMSPIDER_ESP)) esp_momspider_enabled = !esp_momspider_enabled;
-    if (keybind_pressed(KEYBIND_ARROWS))     esp_arrows_enabled = !esp_arrows_enabled;
-    if (keybind_pressed(KEYBIND_FULLBRIGHT)) fullbright_enabled = !fullbright_enabled;
-    if (keybind_pressed(KEYBIND_BLIND))      granny_is_blind = !granny_is_blind;
-    if (keybind_pressed(KEYBIND_DEAF))       granny_is_deaf = !granny_is_deaf;
-    if (keybind_pressed(KEYBIND_NOCLIP))     player_noclip_enabled = !player_noclip_enabled;
+    /* Every one of these announces itself: a keybind changes something you
+     * often can't see from where you're standing, which is the whole point
+     * of the toast. The name comes from the keybind table so the message and
+     * the Keybinds tab can't drift apart. */
+    if (keybind_pressed(KEYBIND_GRANNY_ESP)) {
+        esp_granny_enabled = !esp_granny_enabled;
+        notify_toggle(keybind_name(KEYBIND_GRANNY_ESP), esp_granny_enabled);
+    }
+    if (keybind_pressed(KEYBIND_ITEM_ESP)) {
+        esp_items_enabled = !esp_items_enabled;
+        notify_toggle(keybind_name(KEYBIND_ITEM_ESP), esp_items_enabled);
+    }
+    if (keybind_pressed(KEYBIND_MOMSPIDER_ESP)) {
+        esp_momspider_enabled = !esp_momspider_enabled;
+        notify_toggle(keybind_name(KEYBIND_MOMSPIDER_ESP), esp_momspider_enabled);
+    }
+    if (keybind_pressed(KEYBIND_ARROWS)) {
+        esp_arrows_enabled = !esp_arrows_enabled;
+        notify_toggle(keybind_name(KEYBIND_ARROWS), esp_arrows_enabled);
+    }
+    if (keybind_pressed(KEYBIND_FULLBRIGHT)) {
+        fullbright_enabled = !fullbright_enabled;
+        notify_toggle(keybind_name(KEYBIND_FULLBRIGHT), fullbright_enabled);
+    }
+    if (keybind_pressed(KEYBIND_BLIND)) {
+        granny_is_blind = !granny_is_blind;
+        notify_toggle(keybind_name(KEYBIND_BLIND), granny_is_blind);
+    }
+    if (keybind_pressed(KEYBIND_DEAF)) {
+        granny_is_deaf = !granny_is_deaf;
+        granny_apply_deaf();
+        notify_toggle(keybind_name(KEYBIND_DEAF), granny_is_deaf);
+    }
+    if (keybind_pressed(KEYBIND_NOCLIP)) {
+        player_noclip_enabled = !player_noclip_enabled;
+        notify_toggle(keybind_name(KEYBIND_NOCLIP), player_noclip_enabled);
+    }
 
+    /* These two report the state AFTER applying, because a failed patch
+     * reverts the flag -- so the toast tells you what actually happened
+     * rather than what you asked for. */
     if (keybind_pressed(KEYBIND_IMMORTALITY)) {
         immortality = !immortality;
         granny_apply_immortality();
+        notify_toggle(keybind_name(KEYBIND_IMMORTALITY), immortality);
     }
     if (keybind_pressed(KEYBIND_DISABLE_TRAPS)) {
         traps_disabled = !traps_disabled;
         traps_apply();
+        notify_toggle(keybind_name(KEYBIND_DISABLE_TRAPS), traps_disabled);
     }
 
     if (keybind_pressed(KEYBIND_MOVE_SPEED)) {
         player_speed_enabled = !player_speed_enabled;
         player_mark_dirty();
+        notify_toggle(keybind_name(KEYBIND_MOVE_SPEED), player_speed_enabled);
     }
     if (keybind_pressed(KEYBIND_GRANNY_SPEED)) {
         granny_speed_enabled = !granny_speed_enabled;
         granny_speed_mark_dirty();
+        notify_toggle(keybind_name(KEYBIND_GRANNY_SPEED), granny_speed_enabled);
     }
     /* Freeze shares the speed override's saved originals, so it raises the
      * same dirty flag -- see the checkbox in the Granny tab. */
     if (keybind_pressed(KEYBIND_FREEZE)) {
         granny_freeze_enabled = !granny_freeze_enabled;
         granny_speed_mark_dirty();
+        notify_toggle(keybind_name(KEYBIND_FREEZE), granny_freeze_enabled);
     }
 
     /* The two one-shots. Stop granny is irreversible, so it reports failure
      * through the same flag the button uses. */
+    /* The one-shots have no state to look at, so they need this more than
+     * the toggles do -- without it a press that quietly did nothing is
+     * indistinguishable from one that worked. */
     if (keybind_pressed(KEYBIND_STOP_GRANNY)) {
         g_stop_granny_failed = !granny_stop_ai();
+        if (g_stop_granny_failed) {
+            notify_warn("Stop granny: no Granny in the level");
+        } else {
+            notify_push("Stop granny: done");
+        }
     }
     if (keybind_pressed(KEYBIND_SPAWN_ITEM)) {
         spawn_request_item(spawn_selected_index);
+        char line[64];
+        lstrcpynA(line, "Spawned ", sizeof(line));
+        lstrcpynA(line + 8, spawn_item_name(spawn_selected_index), (int)sizeof(line) - 8);
+        notify_push(line);
     }
     if (keybind_pressed(KEYBIND_SPAWN_ALL)) {
         /* Same button semantics: pressing it again while it runs stops it. */
         if (spawn_bulk_active()) {
             spawn_cancel_all();
+            notify_push("Spawn every item: stopped");
         } else {
             spawn_request_all();
+            notify_push("Spawning every item...");
         }
     }
 }
@@ -698,8 +833,11 @@ static HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swap_chain, UINT
 
     handle_keybinds();
 
-    /* Skip the whole ImGui frame when there's nothing to show at all. */
-    if (g_menu_visible || esp_granny_enabled || esp_items_enabled) {
+    /* Skip the whole ImGui frame when there's nothing to show at all --
+     * including a toast still on screen, or the one case that most needs
+     * feedback (every feature off, menu closed) would never show one. */
+    if (g_menu_visible || esp_granny_enabled || esp_items_enabled ||
+        esp_momspider_enabled || notify_active()) {
         render_frame();
     }
 

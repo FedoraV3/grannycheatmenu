@@ -1,4 +1,5 @@
 #include "overlay/esp.h"
+#include "overlay/d3d11_hook.h"
 #include "game/ai_granny_hook.h"
 #include "game/fullbright.h"
 #include "game/offsets.h"
@@ -546,12 +547,26 @@ static void multiply_unity_matrices(const float *a, const float *b, esp_mat4 *ou
 	}
 }
 
+/*
+ * Alive isn't enough for a camera -- it has to be the one rendering.
+ *
+ * Hiding under a bed or in the car switches the game to another camera and
+ * disables PlayerCam rather than destroying it, so m_CachedPtr stays set and
+ * every liveness check passes. Reading matrices off it then yields whatever
+ * it saw the moment it was switched off, which is why the overlay froze into
+ * a stale frame instead of going away while hidden.
+ */
+static bool camera_usable(uintptr_t base, void *camera) {
+	if (!unity_object_alive(camera)) return false;
+	return ((GameObject_get_active_t)(base + OFFSET_Behaviour_get_isActiveAndEnabled))(camera, NULL);
+}
+
 /* PlayerStatus holds PlayerCam, so any object that references PlayerStatus
  * is a route to the camera. */
-static void *camera_via_player_status(void *player_status) {
+static void *camera_via_player_status(uintptr_t base, void *player_status) {
 	if (!unity_object_alive(player_status)) return NULL;
 	void *camera = *(void **)((uintptr_t)player_status + FIELD_PlayerStatus_PlayerCam);
-	return unity_object_alive(camera) ? camera : NULL;
+	return camera_usable(base, camera) ? camera : NULL;
 }
 
 /* Three routes, cheapest and most reliable first:
@@ -565,13 +580,17 @@ static void *camera_via_player_status(void *player_status) {
  *
  * Routes 2 and 3 are pure pointer derefs -- no tags, no IL2CPP calls. */
 static void *resolve_camera(uintptr_t base) {
+	/* Camera.main is checked first and needs no extra validation -- Unity
+	 * only ever returns an active, enabled camera from it. It returns NULL in
+	 * this game, which is why the fallbacks exist, but if a hiding camera
+	 * ever were tagged MainCamera this would pick it up for free. */
 	void *camera = ((Camera_get_main_t)(base + OFFSET_Camera_get_main))(NULL);
 	if (unity_object_alive(camera)) return camera;
 
 	void *pickray = g_pickray;
 	if (unity_object_alive(pickray)) {
 		camera = camera_via_player_status(
-		    *(void **)((uintptr_t)pickray + FIELD_PickRay_PlayerStatus));
+		    base, *(void **)((uintptr_t)pickray + FIELD_PickRay_PlayerStatus));
 		if (camera) return camera;
 	}
 
@@ -579,7 +598,7 @@ static void *resolve_camera(uintptr_t base) {
 	if (!unity_object_alive(granny)) return NULL;
 
 	return camera_via_player_status(
-	    *(void **)((uintptr_t)granny + FIELD_AI_Granny_PlayerStatus));
+	    base, *(void **)((uintptr_t)granny + FIELD_AI_Granny_PlayerStatus));
 }
 
 /* Main thread only. Refreshed from both hooks so the overlay still has a
@@ -1452,11 +1471,16 @@ void esp_render(void) {
 	}
 
 	if (!g_have_view_projection) {
-		/* Say so on screen rather than silently drawing nothing, so it's
-		 * obvious the overlay is alive and just missing data. */
-		ImDrawList *draw = ImGui::GetBackgroundDrawList();
-		draw->AddText(ImVec2(12.0f, 12.0f), IM_COL32(255, 160, 60, 255),
-		              "[esp] waiting for camera (is a level loaded?)");
+		/* Only while the menu is open. This is a diagnostic -- the game
+		 * thread is running but no camera can be resolved -- and that is now
+		 * a perfectly ordinary state: it is what hiding under a bed or in the
+		 * car looks like. Printing it over the screen every time you hide
+		 * would make the message useless and the hiding unpleasant. */
+		if (overlay_menu_open()) {
+			ImDrawList *draw = ImGui::GetBackgroundDrawList();
+			draw->AddText(ImVec2(12.0f, 12.0f), IM_COL32(255, 160, 60, 255),
+			              "[esp] no camera (hidden, loading, or no level)");
+		}
 		esp_unlock();
 		return;
 	}
