@@ -397,6 +397,24 @@ static void draw_direction_arrow(esp_vec3 world, ImU32 color, const char *name) 
 	const ImVec2 screen = ImGui::GetIO().DisplaySize;
 	if (!(screen.x > 0.0f) || !(screen.y > 0.0f)) return;
 
+	/*
+	 * Camera.projectionMatrix is the standard perspective form, so
+	 *
+	 *     clip_x = (f / aspect) * view_x
+	 *     clip_y =  f           * view_y
+	 *     clip_w = -view_z
+	 *
+	 * Both x and y scale by a POSITIVE factor. clip_x therefore carries the
+	 * sign of view_x -- right of the camera is clip_x > 0 -- whether the
+	 * target is in front of you or behind you. Only w changes sign.
+	 *
+	 * That matters because the mirroring everyone associates with a negative
+	 * w is introduced BY the division, not present in the clip coordinates.
+	 * Skip the division and there is nothing to undo, so the raw clip x and y
+	 * give the correct heading in every case. An earlier version negated them
+	 * for w < 0, which double-corrected and swapped left with right for
+	 * anything behind the player -- the exact case the arrows exist for.
+	 */
 	float ndc_x, ndc_y;
 	if (clip_w > 0.1f) {
 		ndc_x = clip_x / clip_w;
@@ -404,27 +422,31 @@ static void draw_direction_arrow(esp_vec3 world, ImU32 color, const char *name) 
 		/* On screen already -- the box has it covered, and an arrow pointing
 		 * at something you can see is just clutter. */
 		if (ndc_x >= -1.0f && ndc_x <= 1.0f && ndc_y >= -1.0f && ndc_y <= 1.0f) return;
-	} else if (clip_w >= 0.0f) {
-		/* In front of the camera but too close to divide by. The direction is
-		 * still correct here, only the magnitude blows up -- and the vector is
-		 * normalised below, so the raw clip values do fine. Lumping this in
-		 * with the negation below pointed the arrow directly away from an
-		 * enemy standing on top of you, which is the one moment it matters. */
+	} else {
+		/* Behind the camera, or in front but too close to divide by. Either
+		 * way the heading is already in the clip values; only the magnitude
+		 * is meaningless, and that is normalised away below. */
 		ndc_x = clip_x;
 		ndc_y = clip_y;
-	} else {
-		/* Genuinely behind: a negative w mirrors the point through the origin,
-		 * so the sign has to come back off before the direction means
-		 * anything. */
-		ndc_x = -clip_x;
-		ndc_y = -clip_y;
 	}
 
 	/* Screen y grows downward, clip y grows upward. */
 	float dir_x = ndc_x;
 	float dir_y = -ndc_y;
-	const float length = sqrtf(dir_x * dir_x + dir_y * dir_y);
-	if (!isfinite(length) || length < 1e-4f) return;
+	float length = sqrtf(dir_x * dir_x + dir_y * dir_y);
+	if (!isfinite(length)) return;
+
+	if (length < 1e-4f) {
+		/* Dead centre: the target is on the camera axis, so there is no
+		 * sideways component to point along. Behind you that is worth saying
+		 * -- straight down reads as "turn around" -- while in front it means
+		 * they are on screen and the box already has it. */
+		if (clip_w >= 0.0f) return;
+		dir_x = 0.0f;
+		dir_y = 1.0f;
+		length = 1.0f;
+	}
+
 	dir_x /= length;
 	dir_y /= length;
 
