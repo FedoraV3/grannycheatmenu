@@ -1327,8 +1327,6 @@ static void __fastcall hooked_pickray_update(void *instance) {
 	/* Reads HandlePuzzles through this same PickRay, so it belongs on the
 	 * main thread beside the others. */
 	unlock_tick(instance);
-	/* Sampled before the original runs; the matching restore is after it. */
-	unlock_pre_update(instance);
 
 	/* The cellar unloading doesn't tell us anything -- the spider's Update
 	 * just stops firing, leaving the last position on screen forever. Its
@@ -1378,11 +1376,9 @@ static void __fastcall hooked_pickray_update(void *instance) {
 	 * walk of at most 192 pointers, two loads each. */
 	esp_prune_registry();
 
+	/* Nothing after this: PickRay::Update can tear the player down before it
+	 * returns, so `instance` is not safe to touch once it has run. */
 	original_pickray_update(instance);
-
-	/* Only after the game has had its turn: this undoes the drop button that
-	 * an interaction just hid while your hands were still full. */
-	unlock_post_update(instance);
 }
 
 int esp_install_hooks(void) {

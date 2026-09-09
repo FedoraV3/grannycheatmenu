@@ -262,31 +262,23 @@ static bool drop_active(uintptr_t base, void *drop) {
 	return ((GameObject_get_active_t)(base + OFFSET_GameObject_get_activeSelf))(drop, NULL);
 }
 
-void unlock_pre_update(void *pickray) {
-	g_click_pending = false;
-	g_drop_was_active = false;
-	if (!unlock_enabled || !object_alive(pickray)) return;
-
-	/* Nothing to undo unless an interaction is about to be processed. */
-	if (!*(volatile bool *)((uintptr_t)pickray + FIELD_PickRay_buttonClicked)) return;
-
-	uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
-	if (base == 0) return;
-
-	void *drop = *(void **)((uintptr_t)pickray + FIELD_PickRay_Drop1);
-	if (!object_alive(drop)) return;
-
-	g_click_pending = true;
-	g_drop_was_active = drop_active(base, drop);
-}
-
-void unlock_post_update(void *pickray) {
+/*
+ * Deferred to the START of the next tick rather than done after the game
+ * Update returns.
+ *
+ * PickRay::Update handles death, the escape sequence and level transitions,
+ * so it can tear the player down before it returns -- and reading the
+ * PickRay afterwards means trusting a pointer nothing roots, with
+ * m_CachedPtr as the only guard, which cannot tell a destroyed object from a
+ * block the GC has reused. SetActive is worse still: it fires OnEnable
+ * synchronously, re-entering game code partway through a frame, from inside
+ * a detour of the Update that is still unwinding.
+ *
+ * Doing the comparison one frame later costs nothing anyone can see and
+ * touches only the instance the hook was just handed.
+ */
+static void restore_drop_if_hidden(uintptr_t base, void *pickray) {
 	if (!g_click_pending || !g_drop_was_active) return;
-	g_click_pending = false;
-	if (!unlock_enabled || !object_alive(pickray)) return;
-
-	uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
-	if (base == 0) return;
 
 	void *drop = *(void **)((uintptr_t)pickray + FIELD_PickRay_Drop1);
 	if (!object_alive(drop)) return;
@@ -298,9 +290,34 @@ void unlock_post_update(void *pickray) {
 	}
 }
 
+/* Records whether an interaction is about to run this frame, and what the
+ * drop button looked like before it did. */
+static void sample_drop_state(uintptr_t base, void *pickray) {
+	g_click_pending = false;
+	g_drop_was_active = false;
+
+	if (!*(volatile bool *)((uintptr_t)pickray + FIELD_PickRay_buttonClicked)) return;
+
+	void *drop = *(void **)((uintptr_t)pickray + FIELD_PickRay_Drop1);
+	if (!object_alive(drop)) return;
+
+	g_click_pending = true;
+	g_drop_was_active = drop_active(base, drop);
+}
+
 void unlock_tick(void *pickray) {
-	if (!unlock_enabled) return;
+	if (!unlock_enabled) {
+		g_click_pending = false;
+		return;
+	}
 	if (!object_alive(pickray)) return;
+
+	uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
+	if (base != 0) {
+		/* Last frame's interaction first, then sample this frame's. */
+		restore_drop_if_hidden(base, pickray);
+		sample_drop_state(base, pickray);
+	}
 
 	/* HandlePuzzles is a scene object like any other, and it is rebuilt on
 	 * every level load -- so it's re-read from the PickRay each tick rather

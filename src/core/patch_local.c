@@ -65,26 +65,47 @@ BOOL patch_bytes_local(uintptr_t address, const uint8_t *new_bytes, size_t len, 
     }
 
     /*
-     * Written back-to-front, one byte at a time, with the first byte last.
+     * The whole patch has to land as ONE store wherever it can.
      *
-     * This is live code with the game running: nothing suspends the other
-     * threads, so one of them can execute this very instruction while the
-     * copy is in progress. A forward memcpy can leave the opcode byte
-     * replaced while the operands still belong to the old instruction --
-     * over `test al, al` (84 C0) that briefly reads `0C C0`, but the other
-     * interleaving gives `84 01`, which decodes as `test al, byte ptr [rcx]`
-     * and dereferences whatever rcx happens to hold.
+     * This is live code with the game running and nothing suspends the other
+     * threads, so one of them can be executing this very instruction while
+     * the copy happens. Any byte-at-a-time order is unsafe, and the
+     * back-to-front order that looks safest is the worse of the two: over
+     * `test al, al` (84 C0) it leaves `84 00` in flight, and while ModRM C0
+     * names the register al, ModRM 00 names [rax] -- so that intermediate
+     * decodes as `test [rax], al` and dereferences a register holding a
+     * boolean. Forward order merely gives `or al, 0C0h`, which is harmless.
      *
-     * Writing the opcode byte last means every intermediate state still
-     * begins with the ORIGINAL opcode, so the instruction keeps its original
-     * length and the operand bytes are the only thing in flux. That is not a
-     * substitute for suspending threads the way MinHook does, but it removes
-     * the interleaving that can fabricate a memory reference out of an
-     * instruction that had none.
+     * A single naturally-sized store cannot be observed half-done on x86, so
+     * for the sizes actually in use -- 1 and 2 bytes -- there is no window at
+     * all. For a longer patch the tail goes first and the leading 8 bytes
+     * land as one store, which keeps the original opening instruction intact
+     * and decodable until the very last write.
      */
     volatile uint8_t *target = (volatile uint8_t *)address;
-    for (size_t i = len; i-- > 0; ) {
+    size_t head = len;
+    if (head > 8) head = 8;
+    else if (head > 4) head = 4;   /* 5..7 -> settle for a 4-byte head */
+    else if (head == 3) head = 2;
+
+    for (size_t i = len; i-- > head; ) {
         target[i] = new_bytes[i];
+    }
+
+    if (head == 8) {
+        uint64_t word;
+        memcpy(&word, new_bytes, 8);
+        *(volatile uint64_t *)target = word;
+    } else if (head == 4) {
+        uint32_t word;
+        memcpy(&word, new_bytes, 4);
+        *(volatile uint32_t *)target = word;
+    } else if (head == 2) {
+        uint16_t word;
+        memcpy(&word, new_bytes, 2);
+        *(volatile uint16_t *)target = word;
+    } else if (head == 1) {
+        target[0] = new_bytes[0];
     }
 
     DWORD restored_protect;

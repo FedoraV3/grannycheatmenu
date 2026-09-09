@@ -45,35 +45,26 @@ extern bool unlock_enabled;
 bool unlock_apply(void);
 
 /**
- * @brief Sample the drop state before PickRay::Update runs. Main thread.
- *
- * Pair with unlock_post_update(), around the call to the original.
- */
-void unlock_pre_update(void *pickray);
-
-/**
- * @brief Put the drop button back if the interaction just hid it.
- *
- * Every interaction calls Drop1.SetActive(false) as part of "you used your
- * item", and the drop key is gated on Drop1.activeSelf -- so with the
- * requirement checks forced, using something while holding an unrelated item
- * kills dropping until the next pickup.
- *
- * Restoring it unconditionally worked but left the drop prompt showing with
- * empty hands. This only undoes a hide that an interaction actually caused:
- * it needs buttonClicked to have been set at entry AND Drop1 to have been
- * active before the original ran, so a genuine drop -- which also hides
- * Drop1, but is driven by the drop key rather than the interact click -- is
- * left alone, and an interaction with nothing in hand has nothing to put
- * back.
- */
-void unlock_post_update(void *pickray);
-
-/**
  * @brief Hold the requirement flags true. Main thread only.
  *
  * Call from the PickRay::Update hook, passing that hook's instance -- the
  * PickRay is the only route to HandlePuzzles.
+ *
+ * Also puts the drop button back when an interaction hid it while your
+ * hands were still full. Every interaction calls Drop1.SetActive(false) as
+ * part of "you used your item", and the drop key is gated on
+ * Drop1.activeSelf -- so with the requirement checks forced, using something
+ * while holding an unrelated item kills dropping until the next pickup.
+ *
+ * Restoring it unconditionally worked but left the drop prompt showing with
+ * empty hands, so it is narrowed to a hide an interaction actually caused:
+ * buttonClicked set at entry AND Drop1 active beforehand. A genuine drop
+ * also hides Drop1 but is driven by the drop key, so buttonClicked is clear
+ * and it is left alone; an interaction with nothing in hand has nothing to
+ * put back.
+ *
+ * The comparison happens a frame later, at the start of the next tick, so
+ * that nothing runs after the game has had its own Update.
  *
  * @param pickray The live PickRay, or NULL.
  */
