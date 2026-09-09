@@ -56,6 +56,7 @@ cheat_sources = [
     'src/game/player.c',
     'src/game/spawn.c',
     'src/game/traps.c',
+    'src/game/unlock.c',
 
     'src/overlay/d3d11_hook.cpp',
     'src/overlay/esp.cpp',

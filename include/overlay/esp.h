@@ -170,6 +170,8 @@ int esp_install_hooks(void);
 
 /** Snapshot of the ESP's internal state, for the menu's Debug tab. */
 typedef struct {
+	bool feed_live;             /**< The game thread is still calling in. */
+	unsigned long feed_age_ms;  /**< How long since it last did. */
 	bool have_view_projection;  /**< A camera matrix has been captured. */
 	bool have_granny_position;  /**< Granny's transform position was read. */
 	bool have_spider_position;  /**< The Mom Spider's position was read. */

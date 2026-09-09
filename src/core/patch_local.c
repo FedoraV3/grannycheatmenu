@@ -63,13 +63,45 @@ BOOL patch_bytes_local(uintptr_t address, const uint8_t *new_bytes, size_t len, 
     if (old_bytes_out) {
         memcpy(old_bytes_out, (const void *)address, len);
     }
-    memcpy((void *)address, new_bytes, len);
+
+    /*
+     * Written back-to-front, one byte at a time, with the first byte last.
+     *
+     * This is live code with the game running: nothing suspends the other
+     * threads, so one of them can execute this very instruction while the
+     * copy is in progress. A forward memcpy can leave the opcode byte
+     * replaced while the operands still belong to the old instruction --
+     * over `test al, al` (84 C0) that briefly reads `0C C0`, but the other
+     * interleaving gives `84 01`, which decodes as `test al, byte ptr [rcx]`
+     * and dereferences whatever rcx happens to hold.
+     *
+     * Writing the opcode byte last means every intermediate state still
+     * begins with the ORIGINAL opcode, so the instruction keeps its original
+     * length and the operand bytes are the only thing in flux. That is not a
+     * substitute for suspending threads the way MinHook does, but it removes
+     * the interleaving that can fabricate a memory reference out of an
+     * instruction that had none.
+     */
+    volatile uint8_t *target = (volatile uint8_t *)address;
+    for (size_t i = len; i-- > 0; ) {
+        target[i] = new_bytes[i];
+    }
 
     DWORD restored_protect;
     VirtualProtect((LPVOID)address, len, old_protect, &restored_protect);
     FlushInstructionCache(GetCurrentProcess(), (LPCVOID)address, len);
 
     return TRUE;
+}
+
+BOOL patch_bytes_checked(uintptr_t address, const uint8_t *expected,
+                          const uint8_t *new_bytes, size_t len, uint8_t *old_bytes_out) {
+    /* Read before touching the protection: if this isn't the instruction we
+     * think it is, the safest thing is to have done nothing at all. */
+    if (memcmp((const void *)address, expected, len) != 0) {
+        return FALSE;
+    }
+    return patch_bytes_local(address, new_bytes, len, old_bytes_out);
 }
 
 BOOL restore_bytes_local(uintptr_t address, const uint8_t *old_bytes, size_t len) {

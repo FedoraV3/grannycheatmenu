@@ -38,6 +38,28 @@ extern bool player_noclip_enabled;
 extern bool player_no_hard_landing;
 
 /**
+ * Bound to the Player tab's "Air control" checkbox.
+ *
+ * MobileFPS::Update forces moveSpeed to zero for as long as FallingHolder
+ * says you are falling, so stepping off anything costs you all steering
+ * until you land. This NOPs the two branches that do it -- one for standing,
+ * one for crouched -- leaving the rest of the falling logic untouched, so
+ * landings, fall damage and the fall sounds behave exactly as before.
+ */
+extern bool player_air_control;
+
+/**
+ * @brief Push `player_air_control` into the game.
+ *
+ * Applies or lifts the byte patch. Reverts the flag on failure so the menu
+ * never shows a state the game isn't in. Safe from the menu thread: it
+ * writes to code pages only, never into IL2CPP.
+ *
+ * @return true if the game is now in the requested state.
+ */
+bool player_apply_air_control(void);
+
+/**
  * @brief Hook MobileFPS::Update, which drives both features on this tab.
  *
  * MinHook must already be initialized and GameAssembly.dll loaded. Same

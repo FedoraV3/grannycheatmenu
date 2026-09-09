@@ -3,6 +3,7 @@
 #include "game/fullbright.h"
 #include "game/offsets.h"
 #include "game/spawn.h"
+#include "game/unlock.h"
 #include "MinHook.h"
 
 #include <windows.h>
@@ -39,6 +40,27 @@ float esp_spider_box_width_ratio = 1.80f;
 
 static esp_mat4 g_view_projection;
 static bool g_have_view_projection = false;
+
+/*
+ * When the game thread last handed us anything, in milliseconds.
+ *
+ * Everything drawn here is fed from the AI_Granny and PickRay hooks, and in
+ * the main menu neither of them runs -- so nothing clears the flags and the
+ * last frame's camera matrix and positions stay behind, projecting a Granny
+ * box over the menu. The spider had the same problem and could be fixed by
+ * watching its instance die, but that trick doesn't generalise: here it is
+ * the feed itself that stops, and no game-side pointer says so.
+ *
+ * So the render thread decides for itself. It cannot ask IL2CPP anything, but
+ * it can notice that nobody has called in for a while, which covers the menu,
+ * loading, scene changes and a pause alike without knowing about any of them.
+ */
+static volatile unsigned long long g_last_feed_ms = 0;
+
+/* Long enough not to blink during a slow physics tick -- FixedUpdate is 50Hz
+ * and PickRay::Update is per frame -- short enough that the overlay is gone
+ * before the menu has finished fading in. */
+#define ESP_FEED_TIMEOUT_MS 250
 
 static esp_vec3 g_granny_position;
 static bool g_have_granny_position = false;
@@ -225,6 +247,16 @@ static bool item_seed_still_valid(void *instance) {
 void esp_get_debug_info(esp_debug_info *out) {
 	if (!out) return;
 	esp_lock();
+	/* Reported alongside the flags because esp_render() discards everything
+	 * once the feed goes quiet -- without this the Debug tab cheerfully says
+	 * "camera matrix ok" over a menu that is deliberately drawing nothing,
+	 * which is exactly the wrong answer on the tab you'd open to find out
+	 * why. */
+	const unsigned long long feed_now = (unsigned long long)GetTickCount64();
+	const unsigned long long feed_last = g_last_feed_ms;
+	out->feed_age_ms = (unsigned long)(feed_last == 0 ? 0 : feed_now - feed_last);
+	out->feed_live = (feed_last != 0 && feed_now - feed_last <= ESP_FEED_TIMEOUT_MS);
+
 	out->have_view_projection = g_have_view_projection;
 	out->have_granny_position = g_have_granny_position;
 	out->have_spider_position = g_have_spider_position;
@@ -249,6 +281,11 @@ void esp_get_debug_info(esp_debug_info *out) {
 
 void esp_set_view_projection(const esp_mat4 *vp) {
 	esp_lock();
+	/* Stamped whether or not a camera was found: what this records is that
+	 * the game thread is alive and still calling, which is a different
+	 * question from whether it could resolve a camera. Failing to resolve one
+	 * is worth a diagnostic on screen; not being called at all is not. */
+	g_last_feed_ms = (unsigned long long)GetTickCount64();
 	if (vp) {
 		g_view_projection = *vp;
 		g_have_view_projection = true;
@@ -1268,6 +1305,9 @@ static void __fastcall hooked_pickray_update(void *instance) {
 	/* Same reason: Instantiate is an IL2CPP call, and the Spawn button that
 	 * queues one is clicked on the present thread. */
 	spawn_tick(instance);
+	/* Reads HandlePuzzles through this same PickRay, so it belongs on the
+	 * main thread beside the others. */
+	unlock_tick(instance);
 
 	/* The cellar unloading doesn't tell us anything -- the spider's Update
 	 * just stops firing, leaving the last position on screen forever. Its
@@ -1399,6 +1439,17 @@ void esp_render(void) {
 	 * takes this to publish, never across its IL2CPP walk, so the wait here
 	 * is short. */
 	esp_lock();
+
+	/* Nothing has fed us recently, so the game thread has stopped -- the menu,
+	 * a scene change, or a load. Draw nothing at all rather than the status
+	 * line below: there is no camera because there is no game, which isn't a
+	 * fault worth reporting over the top of the menu. */
+	const unsigned long long now = (unsigned long long)GetTickCount64();
+	const unsigned long long last = g_last_feed_ms;
+	if (last == 0 || now - last > ESP_FEED_TIMEOUT_MS) {
+		esp_unlock();
+		return;
+	}
 
 	if (!g_have_view_projection) {
 		/* Say so on screen rather than silently drawing nothing, so it's

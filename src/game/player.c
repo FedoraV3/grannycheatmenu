@@ -11,6 +11,7 @@ bool player_speed_enabled = false;
 float player_speed_multiplier = 1.0f;
 bool player_noclip_enabled = false;
 bool player_no_hard_landing = false;
+bool player_air_control = false;
 
 static MobileFPS_Update_t original_update = NULL;
 static void *volatile g_player = NULL;
@@ -73,6 +74,67 @@ static float read_float(void *instance, uintptr_t field) {
 
 static void write_float(void *instance, uintptr_t field, float value) {
 	*(volatile float *)((uintptr_t)instance + field) = value;
+}
+
+/* Air control: the two `jnz` that route a falling frame to `moveSpeed = 0`.
+ * Two NOPs each, so the fall falls through to the real speed instead. */
+static bool g_air_patched = false;
+static const uint8_t g_nop2[MOBILEFPS_FALL_GATE_SIZE] = { 0x90, 0x90 };
+/* Both gates are the same two bytes -- `jnz short` over the seven that load
+ * the real speed. Verified before writing so a shifted offset refuses rather
+ * than NOPing out whatever now lives there. */
+static const uint8_t g_expect_jnz[MOBILEFPS_FALL_GATE_SIZE] = { 0x75, 0x07 };
+static uint8_t g_air_original[2][MOBILEFPS_FALL_GATE_SIZE];
+
+bool player_apply_air_control(void) {
+	if (g_base == 0) {
+		player_air_control = false;
+		return false;
+	}
+	if (player_air_control == g_air_patched) return true;
+
+	const uintptr_t sites[2] = {
+		g_base + OFFSET_MobileFPS_FallGate_Stand,
+		g_base + OFFSET_MobileFPS_FallGate_Crouch,
+	};
+
+	if (player_air_control) {
+		for (int i = 0; i < 2; i++) {
+			if (patch_bytes_checked(sites[i], g_expect_jnz, g_nop2,
+			                        MOBILEFPS_FALL_GATE_SIZE, g_air_original[i])) {
+				continue;
+			}
+			OutputDebugStringA("[cheat] falling speed gate is not `jnz short`, refusing to patch");
+			/* Standing patched without crouched would give air control only
+			 * while upright, which is stranger than neither. */
+			for (int j = 0; j < i; j++) {
+				restore_bytes_local(sites[j], g_air_original[j], MOBILEFPS_FALL_GATE_SIZE);
+			}
+			player_air_control = false;
+			return false;
+		}
+		g_air_patched = true;
+		OutputDebugStringA("[cheat] air control enabled");
+		return true;
+	}
+
+	/* A failed restore keeps the flag set, so the next enable can't save our
+	 * own NOPs over the only copy of those two jumps. */
+	bool restored = true;
+	for (int i = 0; i < 2; i++) {
+		if (!restore_bytes_local(sites[i], g_air_original[i], MOBILEFPS_FALL_GATE_SIZE)) {
+			restored = false;
+		}
+	}
+	if (!restored) {
+		OutputDebugStringA("[cheat] failed to restore the falling speed gate");
+		player_air_control = true;
+		return false;
+	}
+
+	g_air_patched = false;
+	OutputDebugStringA("[cheat] air control disabled");
+	return true;
 }
 
 /* Stops or restores the game's per-frame rewrite of the two speed presets.

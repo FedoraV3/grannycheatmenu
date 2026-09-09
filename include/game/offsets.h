@@ -199,6 +199,34 @@ typedef granny_method_t ItemRepositionSeed_Awake_t;
 static const uintptr_t OFFSET_PickRay_Update                  = 0x237CE0;
 typedef granny_method_t PickRay_Update_t;
 
+/**
+ * PickRay::HP -- HandlePuzzles, the manager that holds one bool per
+ * progression step in the game.
+ *
+ * This is where every lock's "do you have the key" answer actually lives.
+ * There is no comparison against the item in your hand: PickRay::Update
+ * reads a flag off this object and either runs the unlock or prints "It's
+ * locked". Confirmed by tracing the padlocked port -- see unlock.c.
+ */
+static const uintptr_t FIELD_PickRay_HP                   = 0x4D8; /**< HandlePuzzles* */
+
+/**
+ * HandlePuzzles::usedPadlockForPort -- "the padlock has been dealt with".
+ *
+ * The one requirement flag traced end to end so far. Its branch:
+ *
+ *     if (HP.openedPort)         goto done;
+ *     if (!PickRay.buttonClicked) goto done;
+ *     PickRay.buttonClicked = 0;
+ *     if (HP.usedPadlockForPort) HandlePuzzles::OpenPort();
+ *     else                       text("It's locked");
+ *
+ * openedPort (+0x70) is deliberately NOT listed: it means "already open" and
+ * is tested first, so setting it makes the port uninteractable rather than
+ * unlocked. The two kinds of flag look alike and behave oppositely.
+ */
+static const uintptr_t FIELD_HandlePuzzles_usedPadlockForPort = 0x71; /**< bool */
+
 /** PickRay::PlayerStatus -- the Granny-independent path to PlayerCam. */
 static const uintptr_t FIELD_PickRay_PlayerStatus             = 0x88;
 
@@ -609,6 +637,35 @@ typedef void *(__fastcall *Transform_get_rotation_t)(void *ret_quaternion, void 
  * Side effect worth knowing: InWeb no longer slows the player either, since
  * that is the only thing those two constants encode.
  */
+/*
+ * The two branches that kill air control.
+ *
+ * MobileFPS::Update picks the speed it is about to use, and zeroes it
+ * outright while FallingHolder says you are falling -- once for standing and
+ * once for crouched:
+ *
+ *     cmp byte ptr [rax+81h], 0        ; FallingHolder.isFalling
+ *     jnz short zero                   ; 75 07
+ *     movss xmm0, [rdi+44h]            ; SpeedMove (or +48h crouched)
+ *     jmp short store
+ *   zero:
+ *     xorps xmm0, xmm0                 ; moveSpeed = 0
+ *   store:
+ *     movss [rdi+40h], xmm0
+ *
+ * which is why stepping off anything leaves you with no steering at all
+ * until you land. NOPing the two jnz makes the fall load the real speed like
+ * any other frame; nothing else about falling changes, so landing, damage
+ * and the fall sounds all still work.
+ *
+ * Deliberately not done by clearing isFalling -- that flag also drives
+ * landing detection, crouch gating and fall damage, and forcing it false
+ * would quietly disable all three.
+ */
+static const uintptr_t OFFSET_MobileFPS_FallGate_Stand    = 0x22DCE6;
+static const uintptr_t OFFSET_MobileFPS_FallGate_Crouch   = 0x22DD94;
+#define MOBILEFPS_FALL_GATE_SIZE 2
+
 static const uintptr_t OFFSET_MobileFPS_SpeedStores       = 0x22DABA;
 #define MOBILEFPS_SPEED_STORES_SIZE 10
 

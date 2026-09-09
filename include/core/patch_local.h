@@ -47,6 +47,24 @@ uintptr_t aob_scan_local(uintptr_t start, size_t region_size,
 BOOL patch_bytes_local(uintptr_t address, const uint8_t *new_bytes, size_t len, uint8_t *old_bytes_out);
 
 /**
+ * @brief patch_bytes_local(), but only if the target holds what you expect.
+ *
+ * Every RVA in this project is tied to one build of GameAssembly.dll. When
+ * the game updates they all shift, and an unverified write then stamps over
+ * arbitrary code and saves the wreckage as the "original" -- so even undoing
+ * it restores garbage. Comparing first turns that into a clean refusal.
+ *
+ * @param address   Where to patch.
+ * @param expected  The bytes that must already be there, `len` of them.
+ * @param new_bytes The replacement, also `len` bytes.
+ * @param len       Length of all three buffers.
+ * @param old_bytes_out Receives the original bytes; may be NULL.
+ * @return FALSE if the target didn't match, or the write failed.
+ */
+BOOL patch_bytes_checked(uintptr_t address, const uint8_t *expected,
+                          const uint8_t *new_bytes, size_t len, uint8_t *old_bytes_out);
+
+/**
  * @brief Undo a previous patch_bytes_local() call.
  *
  * @param address   Same address that was patched.

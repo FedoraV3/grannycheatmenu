@@ -6,6 +6,7 @@
 #include "game/player.h"
 #include "game/traps.h"
 #include "game/spawn.h"
+#include "game/unlock.h"
 #include "core/keybinds.h"
 #include "core/config.h"
 #include "overlay/esp.h"
@@ -190,6 +191,15 @@ static void draw_player_tab() {
 		                  "Switching it off while inside geometry can wedge you.");
 	}
 
+	if (ImGui::Checkbox("Air control", &player_air_control)) {
+		player_apply_air_control();
+	}
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip("Steer while falling.\n"
+		                  "The game zeroes your speed for the whole fall;\n"
+		                  "this leaves landings and fall damage alone.");
+	}
+
 	ImGui::Checkbox("No hard landing", &player_no_hard_landing);
 	if (ImGui::IsItemHovered()) {
 		ImGui::SetTooltip("Drop from any height and keep walking.\n"
@@ -286,6 +296,21 @@ static void draw_world_tab() {
 	}
 	ImGui::TextDisabled("Bear traps, poison, explosives and the generic trigger.");
 	ImGui::TextDisabled("The traps stay visible -- they just stop firing.");
+
+	ImGui::Separator();
+	if (ImGui::Checkbox("Unlock without keys", &unlock_enabled)) {
+		unlock_apply();
+	}
+	if (ImGui::IsItemHovered()) {
+		ImGui::SetTooltip("Interacting succeeds instead of saying \"I need a ...\"\n"
+		                  "or \"It's locked\". The game's own unlock still runs,\n"
+		                  "so the animation and sound are unchanged.");
+	}
+	/* Honest about the coverage rather than implying it covers everything. */
+	ImGui::TextDisabled("%d requirement checks + %d padlock.",
+	                    unlock_check_count(), unlock_flag_count());
+	ImGui::TextDisabled("Not covered: weight plate, baton charge, camera,");
+	ImGui::TextDisabled("crossbow, find-a-switch, get-closer.");
 
 	ImGui::Separator();
 	ImGui::TextDisabled("Spawn item");
@@ -474,6 +499,13 @@ static void draw_debug_tab() {
 	ImGui::Text("PickRay hook       %lu ticks", esp.pickray_ticks);
 	ImGui::Text("MomSpider hook     %lu ticks", esp.spider_ticks);
 	ImGui::Text("ItemSeed Awake     %lu ticks", esp.item_ticks);
+	if (esp.feed_live) {
+		ImGui::Text("game thread feed   live (%lums ago)", esp.feed_age_ms);
+	} else {
+		/* Everything below is last-known-good and is NOT being drawn. */
+		ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.35f, 1.0f),
+		                   "game thread feed   STALE -- overlay suppressed");
+	}
 	ImGui::Text("camera matrix      %s", esp.have_view_projection ? "ok" : "MISSING");
 	ImGui::Text("granny position    %s", esp.have_granny_position ? "ok" : "MISSING");
 	ImGui::Text("spider position    %s", esp.have_spider_position ? "ok" : "MISSING");

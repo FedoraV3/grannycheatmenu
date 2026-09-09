@@ -6,6 +6,7 @@
 #include "game/player.h"
 #include "game/spawn.h"
 #include "game/traps.h"
+#include "game/unlock.h"
 #include "overlay/esp.h"
 
 #include <windows.h>
@@ -40,6 +41,7 @@ static const cfg_entry g_entries[] = {
 	{ "move_speed_enabled",   CFG_BOOL,  &player_speed_enabled },
 	{ "move_speed",           CFG_FLOAT, &player_speed_multiplier },
 	{ "no_hard_landing",      CFG_BOOL,  &player_no_hard_landing },
+	{ "air_control",          CFG_BOOL,  &player_air_control },
 
 	{ "granny_blind",         CFG_BOOL,  &granny_is_blind },
 	{ "granny_deaf",          CFG_BOOL,  &granny_is_deaf },
@@ -49,6 +51,7 @@ static const cfg_entry g_entries[] = {
 	{ "granny_run_speed",     CFG_FLOAT, &granny_run_speed },
 
 	{ "traps_disabled",       CFG_BOOL,  &traps_disabled },
+	{ "unlock_without_keys",  CFG_BOOL,  &unlock_enabled },
 	{ "spawn_selected",       CFG_INT,   &spawn_selected_index },
 
 	{ "fullbright",           CFG_BOOL,  &fullbright_enabled },
@@ -195,6 +198,8 @@ void config_apply(void) {
 	 * so calling them when nothing was loaded is harmless. */
 	if (immortality) granny_apply_immortality();
 	if (traps_disabled) traps_apply();
+	if (unlock_enabled) unlock_apply();
+	if (player_air_control) player_apply_air_control();
 
 	/* The speed overrides are picked up by their own ticks, but they only
 	 * write on a change -- so tell them something changed. */
