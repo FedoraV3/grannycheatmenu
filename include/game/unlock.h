@@ -57,14 +57,9 @@ bool unlock_apply(void);
  * while holding an unrelated item kills dropping until the next pickup.
  *
  * Restoring it unconditionally worked but left the drop prompt showing with
- * empty hands, so it is narrowed to a hide an interaction actually caused:
- * buttonClicked set at entry AND Drop1 active beforehand. A genuine drop
- * also hides Drop1 but is driven by the drop key, so buttonClicked is clear
- * and it is left alone; an interaction with nothing in hand has nothing to
- * put back.
- *
- * The comparison happens a frame later, at the start of the next tick, so
- * that nothing runs after the game has had its own Update.
+ * empty hands. It is keyed on the honest signal instead: the button going
+ * from shown to hidden while a hand object is still active. A real drop
+ * empties your hands first and is left alone.
  *
  * @param pickray The live PickRay, or NULL.
  */

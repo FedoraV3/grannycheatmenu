@@ -95,6 +95,20 @@ static const struct {
  * tests Input::GetKeyDown, so forcing that one would fire the interaction
  * every frame instead of unlocking anything.
  *
+ * Nine sites are deliberately NOT in this table: the four painting pieces,
+ * the three shotgun parts and the two cogwheels. Those groups are SELECTORS
+ * rather than requirements -- each check asks which of the several pieces you
+ * are holding, and every one jumps somewhere different because the answer
+ * decides what the game does next. Forcing them makes the first check always
+ * win, so the game runs the placement for piece one whatever you hold: the
+ * piece you actually have never goes in, and the bookkeeping still hides the
+ * drop button. They need the real item and there is no patching around that.
+ *
+ * The pliers and chain cutter pairs stay, because those are true
+ * alternatives -- both checks jump to the SAME target, so either item does
+ * the same job and forcing one is harmless. Shared target versus distinct
+ * target is what separates the two cases.
+ *
  * Still not covered, because they aren't possession checks: the weight plate
  * wants weight on it, the baton wants charge, "find a switch" wants world
  * state, and "get closer" is proximity.
@@ -142,13 +156,6 @@ static struct {
 	{ "spark plug",            0x23CD82, { 0 } },
 	{ "fuse",                  0x23CF95, { 0 } },
 	{ "data container",        0x23D192, { 0 } },
-	{ "painting piece 1",      0x23D38B, { 0 } },
-	{ "painting piece 2",      0x23D3AA, { 0 } },
-	{ "painting piece 3",      0x23D3C9, { 0 } },
-	{ "painting piece 4",      0x23D3E8, { 0 } },
-	{ "shotgun part 1",        0x23DAEF, { 0 } },
-	{ "shotgun part 2",        0x23DB0E, { 0 } },
-	{ "shotgun part 3",        0x23DB2D, { 0 } },
 	{ "playhouse key",         0x23DD96, { 0 } },
 	{ "padlock code",          0x23DF54, { 0 } },
 	{ "hammer",                0x23E2D7, { 0 } },
@@ -162,8 +169,6 @@ static struct {
 	{ "screwdriver (2/4)",     0x240FB2, { 0 } },
 	{ "screwdriver (3/4)",     0x24117C, { 0 } },
 	{ "screwdriver (4/4)",     0x241346, { 0 } },
-	{ "cogwheel 1",            0x241B84, { 0 } },
-	{ "cogwheel 2",            0x241BA3, { 0 } },
 	{ "wrench",                0x241DD8, { 0 } },
 	{ "electric (2/2)",        0x241F91, { 0 } },
 	{ "book",                  0x24220A, { 0 } },
@@ -249,10 +254,9 @@ bool unlock_apply(void) {
 	return true;
 }
 
-/* What the drop state looked like at Update's entry, so the hide an
- * interaction causes can be told apart from the one a real drop causes. */
+/* What the drop button looked like on the previous tick, so its
+ * disappearance can be noticed. */
 static bool g_drop_was_active = false;
-static bool g_click_pending = false;
 
 /* activeSelf, not activeInHierarchy: the drop gate reads the object's own
  * flag, and Drop1 hangs off a UI canvas that may be switched off wholesale
@@ -263,61 +267,77 @@ static bool drop_active(uintptr_t base, void *drop) {
 }
 
 /*
- * Deferred to the START of the next tick rather than done after the game
- * Update returns.
+ * The hand objects every requirement check reads, deduplicated.
  *
- * PickRay::Update handles death, the escape sequence and level transitions,
- * so it can tear the player down before it returns -- and reading the
- * PickRay afterwards means trusting a pointer nothing roots, with
- * m_CachedPtr as the only guard, which cannot tell a destroyed object from a
- * block the GC has reused. SetActive is worse still: it fires OnEnable
- * synchronously, re-entering game code partway through a frame, from inside
- * a detour of the Update that is still unwinding.
- *
- * Doing the comparison one frame later costs nothing anyone can see and
- * touches only the instance the hook was just handed.
+ * These are the same PickRay fields the patched `get_activeSelf` calls test,
+ * so "any of these is active" is precisely the game's own notion of holding
+ * something -- which is what Drop1 is supposed to mirror.
  */
-static void restore_drop_if_hidden(uintptr_t base, void *pickray) {
-	if (!g_click_pending || !g_drop_was_active) return;
+static const uintptr_t g_hand_objects[] = {
+	0x258, 0x260, 0x268, 0x270, 0x278, 0x280, 0x298, 0x2A0, 0x2A8, 0x2B0,
+	0x2B8, 0x2C0, 0x2C8, 0x2D0, 0x2D8, 0x2E0, 0x2F0, 0x2F8, 0x300, 0x318,
+	0x320, 0x328, 0x330, 0x338, 0x340, 0x348, 0x350, 0x358, 0x360, 0x368,
+	0x380, 0x390, 0x398, 0x3A0, 0x3A8, 0x3B0, 0x3D8, 0x3E0, 0x3E8, 0x410,
+};
 
-	void *drop = *(void **)((uintptr_t)pickray + FIELD_PickRay_Drop1);
-	if (!object_alive(drop)) return;
+#define HAND_OBJECT_COUNT ((int)(sizeof(g_hand_objects) / sizeof(g_hand_objects[0])))
 
-	/* Was holding something, pressed interact, and the interaction took the
-	 * drop button away. Give it back -- the item is still in hand. */
-	if (!drop_active(base, drop)) {
-		((Unity_set_bool_t)(base + OFFSET_GameObject_SetActive))(drop, true, NULL);
+/* Whether anything is actually in the player's hands. Only called on the
+ * frame the drop button disappears, so the forty getters cost nothing in the
+ * frames that matter. */
+static bool holding_something(uintptr_t base, void *pickray) {
+	for (int i = 0; i < HAND_OBJECT_COUNT; i++) {
+		void *hand = *(void **)((uintptr_t)pickray + g_hand_objects[i]);
+		if (object_alive(hand) && drop_active(base, hand)) return true;
 	}
+	return false;
 }
 
-/* Records whether an interaction is about to run this frame, and what the
- * drop button looked like before it did. */
-static void sample_drop_state(uintptr_t base, void *pickray) {
-	g_click_pending = false;
-	g_drop_was_active = false;
-
-	if (!*(volatile bool *)((uintptr_t)pickray + FIELD_PickRay_buttonClicked)) return;
-
+/*
+ * Put the drop button back when it vanishes while your hands are still full.
+ *
+ * Every interaction calls Drop1.SetActive(false) as part of "you used your
+ * item", and the drop key is gated on Drop1.activeSelf. With the requirement
+ * checks forced, that fires for an item you were not holding -- and when a
+ * puzzle accepts either of two items it can fire for the wrong one even when
+ * you legitimately hold the other -- so dropping dies until the next pickup.
+ *
+ * An earlier attempt keyed this on PickRay.buttonClicked being set at the
+ * hook's entry, which never worked: buttonClicked is BOTH set and consumed
+ * inside PickRay::Update (mov byte ptr [rbx+4D0h], 1 partway through), so at
+ * the entry we sample it is always false and the restore never ran.
+ *
+ * The honest signal doesn't involve the click at all. Watch Drop1 across
+ * frames, and when it goes from shown to hidden, ask whether any hand object
+ * is still active. If one is, the game has hidden the button while you are
+ * demonstrably still holding something, which is never right -- put it back.
+ * A real drop empties your hands first, so it is left alone, and an
+ * interaction with nothing in hand finds nothing active and stays hidden.
+ */
+static void keep_drop_in_sync(uintptr_t base, void *pickray) {
 	void *drop = *(void **)((uintptr_t)pickray + FIELD_PickRay_Drop1);
-	if (!object_alive(drop)) return;
+	if (!object_alive(drop)) {
+		g_drop_was_active = false;
+		return;
+	}
 
-	g_click_pending = true;
-	g_drop_was_active = drop_active(base, drop);
+	bool active = drop_active(base, drop);
+	if (g_drop_was_active && !active && holding_something(base, pickray)) {
+		((Unity_set_bool_t)(base + OFFSET_GameObject_SetActive))(drop, true, NULL);
+		active = true;
+	}
+	g_drop_was_active = active;
 }
 
 void unlock_tick(void *pickray) {
 	if (!unlock_enabled) {
-		g_click_pending = false;
+		g_drop_was_active = false;
 		return;
 	}
 	if (!object_alive(pickray)) return;
 
 	uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
-	if (base != 0) {
-		/* Last frame's interaction first, then sample this frame's. */
-		restore_drop_if_hidden(base, pickray);
-		sample_drop_state(base, pickray);
-	}
+	if (base != 0) keep_drop_in_sync(base, pickray);
 
 	/* HandlePuzzles is a scene object like any other, and it is rebuilt on
 	 * every level load -- so it's re-read from the PickRay each tick rather
