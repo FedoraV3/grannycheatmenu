@@ -1,5 +1,6 @@
 #include "game/player.h"
 #include "game/offsets.h"
+#include "core/crashlog.h"
 #include "core/keybinds.h"
 #include "core/patch_local.h"
 #include "overlay/d3d11_hook.h"
@@ -393,7 +394,9 @@ static void player_tick(void *instance) {
 
 static void __fastcall hooked_update(void *instance) {
 	g_player = instance;
+	crashlog_mark("mobilefps: tick");
 	player_tick(instance);
+	crashlog_mark("mobilefps: original");
 	original_update(instance);
 }
 

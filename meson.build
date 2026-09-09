@@ -47,6 +47,7 @@ dwmapi_dep = cpp.find_library('dwmapi')             # Dwm* calls, used by ImGui'
 cheat_sources = [
     'src/core/dllmain.c',
     'src/core/config.c',
+    'src/core/crashlog.c',
     'src/core/keybinds.c',
     'src/core/patch_local.c',
 

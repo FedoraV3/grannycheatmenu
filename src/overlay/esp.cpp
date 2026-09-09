@@ -5,6 +5,7 @@
 #include "game/offsets.h"
 #include "game/spawn.h"
 #include "game/unlock.h"
+#include "core/crashlog.h"
 #include "MinHook.h"
 
 #include <windows.h>
@@ -1320,12 +1321,15 @@ static void __fastcall hooked_pickray_update(void *instance) {
 
 	/* Main thread, so this is where RenderSettings can safely be touched --
 	 * the checkbox itself is clicked on the present thread. */
+	crashlog_mark("pickray: fullbright");
 	fullbright_tick(instance);
 	/* Same reason: Instantiate is an IL2CPP call, and the Spawn button that
 	 * queues one is clicked on the present thread. */
+	crashlog_mark("pickray: spawn");
 	spawn_tick(instance);
 	/* Reads HandlePuzzles through this same PickRay, so it belongs on the
 	 * main thread beside the others. */
+	crashlog_mark("pickray: unlock");
 	unlock_tick(instance);
 
 	/* The cellar unloading doesn't tell us anything -- the spider's Update
@@ -1341,6 +1345,7 @@ static void __fastcall hooked_pickray_update(void *instance) {
 	if (esp_granny_enabled || esp_items_enabled || esp_momspider_enabled) {
 		uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
 		if (base != 0) {
+			crashlog_mark("pickray: camera");
 			refresh_camera(base);
 
 			/* PickRay is a component on the player, so its transform is the
@@ -1363,6 +1368,7 @@ static void __fastcall hooked_pickray_update(void *instance) {
 			}
 
 			if (esp_items_enabled) {
+				crashlog_mark("pickray: item collect");
 				esp_collect_items(g_item_spawn);
 			}
 		}
@@ -1374,10 +1380,12 @@ static void __fastcall hooked_pickray_update(void *instance) {
 	 * accumulate until the array hits its cap, after which the .ctor hook
 	 * silently discards every new item. Cheap enough to just always do: a
 	 * walk of at most 192 pointers, two loads each. */
+	crashlog_mark("pickray: prune");
 	esp_prune_registry();
 
 	/* Nothing after this: PickRay::Update can tear the player down before it
 	 * returns, so `instance` is not safe to touch once it has run. */
+	crashlog_mark("pickray: original");
 	original_pickray_update(instance);
 }
 

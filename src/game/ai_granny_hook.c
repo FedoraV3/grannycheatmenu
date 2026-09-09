@@ -2,6 +2,7 @@
 #include "game/granny_ai.h"
 #include "game/offsets.h"
 #include "core/patch_local.h"
+#include "core/crashlog.h"
 #include "overlay/esp.h"
 #include "MinHook.h"
 
@@ -68,6 +69,7 @@ static void __fastcall hooked_fixed_update(void *instance) {
     /* This runs on the game's main thread, which is the only safe place to
      * call into IL2CPP -- so ESP gathers its camera/position data here and
      * the render thread just draws the cached results. */
+    crashlog_mark("granny: esp collect");
     esp_collect(instance);
 	
 	/* Blind toggle, polled here because this is the game's main thread.
@@ -102,8 +104,10 @@ static void __fastcall hooked_fixed_update(void *instance) {
 
 	/* Writes only when she's been rebuilt or a control changed -- see
 	 * granny_ai_tick(). */
+	crashlog_mark("granny: ai tick");
 	granny_ai_tick(instance);
 
+    crashlog_mark("granny: original");
     original_fixed_update(instance);
 }
 

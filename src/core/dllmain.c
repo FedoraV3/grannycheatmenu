@@ -5,6 +5,7 @@
 #include "game/ai_granny_hook.h"
 #include "game/player.h"
 #include "core/config.h"
+#include "core/crashlog.h"
 #include "overlay/esp.h"
 #include "overlay/notify.h"
 
@@ -45,6 +46,9 @@ static DWORD WINAPI main_thread(LPVOID param) {
 
     /* Before any hook that can reach esp_collect() is enabled, since the
      * ESP's cross-thread state needs its lock to exist first. */
+    /* First of all, so anything that goes wrong below is recorded. */
+    crashlog_init();
+
     esp_init();
     /* Same reasoning: a toast can be pushed the moment a hook fires, so the
      * list's lock has to exist before any of them are installed. */
