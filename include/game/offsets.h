@@ -228,6 +228,11 @@ typedef granny_method_t PickRay_Update_t;
  */
 static const uintptr_t FIELD_PickRay_Drop1                = 0x30;  /**< GameObject* */
 
+/** PickRay::buttonClicked -- set when interact is pressed, and cleared by
+ *  whichever branch handles it. True at Update's entry means an interaction
+ *  is about to be processed this frame. */
+static const uintptr_t FIELD_PickRay_buttonClicked        = 0x4D0; /**< bool */
+
 /** GameObject::get_activeSelf -- `bool f(GameObject *this, MethodInfo *)`.
  *  Not activeInHierarchy: this is the object's own flag, ignoring whether an
  *  ancestor is switched off, and it is what the drop gate reads. */

@@ -249,6 +249,55 @@ bool unlock_apply(void) {
 	return true;
 }
 
+/* What the drop state looked like at Update's entry, so the hide an
+ * interaction causes can be told apart from the one a real drop causes. */
+static bool g_drop_was_active = false;
+static bool g_click_pending = false;
+
+/* activeSelf, not activeInHierarchy: the drop gate reads the object's own
+ * flag, and Drop1 hangs off a UI canvas that may be switched off wholesale
+ * on PC -- testing the hierarchy would be false forever while the game saw
+ * true. */
+static bool drop_active(uintptr_t base, void *drop) {
+	return ((GameObject_get_active_t)(base + OFFSET_GameObject_get_activeSelf))(drop, NULL);
+}
+
+void unlock_pre_update(void *pickray) {
+	g_click_pending = false;
+	g_drop_was_active = false;
+	if (!unlock_enabled || !object_alive(pickray)) return;
+
+	/* Nothing to undo unless an interaction is about to be processed. */
+	if (!*(volatile bool *)((uintptr_t)pickray + FIELD_PickRay_buttonClicked)) return;
+
+	uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
+	if (base == 0) return;
+
+	void *drop = *(void **)((uintptr_t)pickray + FIELD_PickRay_Drop1);
+	if (!object_alive(drop)) return;
+
+	g_click_pending = true;
+	g_drop_was_active = drop_active(base, drop);
+}
+
+void unlock_post_update(void *pickray) {
+	if (!g_click_pending || !g_drop_was_active) return;
+	g_click_pending = false;
+	if (!unlock_enabled || !object_alive(pickray)) return;
+
+	uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
+	if (base == 0) return;
+
+	void *drop = *(void **)((uintptr_t)pickray + FIELD_PickRay_Drop1);
+	if (!object_alive(drop)) return;
+
+	/* Was holding something, pressed interact, and the interaction took the
+	 * drop button away. Give it back -- the item is still in hand. */
+	if (!drop_active(base, drop)) {
+		((Unity_set_bool_t)(base + OFFSET_GameObject_SetActive))(drop, true, NULL);
+	}
+}
+
 void unlock_tick(void *pickray) {
 	if (!unlock_enabled) return;
 	if (!object_alive(pickray)) return;
@@ -258,34 +307,6 @@ void unlock_tick(void *pickray) {
 	 * than latched, and checked before being written through. */
 	void *puzzles = *(void **)((uintptr_t)pickray + FIELD_PickRay_HP);
 	if (!object_alive(puzzles)) return;
-
-	/*
-	 * Put the drop button back.
-	 *
-	 * Forcing the requirement checks means an interaction can fire while you
-	 * are still holding something, and its bookkeeping hides Drop1 on the
-	 * assumption that your hands are now empty. The drop key is gated on
-	 * Drop1.activeSelf, so dropping stays dead until you pick up something
-	 * else -- which is not obviously connected to the cheat that caused it.
-	 *
-	 * Restoring it unconditionally does mean the drop key works with empty
-	 * hands too, which lands in PickRay::CheckItemDropping's own no-item
-	 * branch (Inventory::DropLogic) rather than anywhere new. That only
-	 * happens while this feature is on, which is a fair trade for dropping
-	 * continuing to work at all.
-	 */
-	void *drop = *(void **)((uintptr_t)pickray + FIELD_PickRay_Drop1);
-	if (object_alive(drop)) {
-		uintptr_t base = (uintptr_t)GetModuleHandleW(L"GameAssembly.dll");
-		/* activeSelf, not activeInHierarchy: the drop gate reads the object's
-		 * own flag, and Drop1 hangs off a UI canvas that may be switched off
-		 * wholesale on PC -- testing the hierarchy would then be false
-		 * forever and fire this every frame while the game saw true. */
-		if (base != 0 &&
-		    !((GameObject_get_active_t)(base + OFFSET_GameObject_get_activeSelf))(drop, NULL)) {
-			((Unity_set_bool_t)(base + OFFSET_GameObject_SetActive))(drop, true, NULL);
-		}
-	}
 
 	/* Held true rather than set once. The game owns these fields and sets
 	 * them itself when you legitimately use an item, and a level load builds
